@@ -1,0 +1,33 @@
+RUN_INSTRUCTIONS for Sentinel Drone Fleet
+---------------------------------------
+
+1) Unzip or place all files into a folder, e.g. C:\Hosting\SentinelDroneFleet
+
+2) Start the application:
+   - Open a Command Prompt (Windows)
+   - Change directory to the api folder:
+       cd C:\Hosting\SentinelDroneFleet\api
+   - Run this command:
+       python server.py
+   OR, run the provided batch file:
+       start_app.bat
+   (Either method should start the server.)
+
+3) App details:
+   - The web front-end files (index.html, main.js, styles.css) are in the root folder.
+   - The backend server is api\server.py (Python).
+   - If Python is not installed on the server, please install Python 3.11 or later.
+   - If any Python packages are required, please run:
+       pip install -r requirements.txt
+     (If there is no requirements.txt, please inspect server.py for needed packages.)
+
+4) Ports:
+   - Please have the server listen on port 80/443 via a reverse proxy (IIS or nginx) so the app is reachable via HTTPS.
+   - If server.py listens on a local port (for example 5000), forward that to the web server.
+
+5) After setup (verification):
+   - Provide a staging URL and confirm the homepage loads.
+   - Create one test user (if sign-up exists) and confirm data saved.
+   - Confirm HTTPS is active.
+
+If anything is unclear, contact: gerhard.faber@forumsekuriteit.co.za
