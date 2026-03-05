@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ACSS- Sentinel Drone Management Systems</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="styles.css?v=2.1">
+</head>
+
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">ACSS-Sentinel Drone Management Systems</div>
+      <div class="actions">
+        <input id="search" type="search" placeholder="🔍 Search drones, pilots, missions...">
+        <button id="exportBtn" type="button" title="Export fleet data">📥 Export</button>
+        <button id="syncBtn" type="button" title="Sync with Cloud">☁️ Cloud Sync</button>
+        <input id="importFile" type="file" accept="application/json" hidden>
+        <button id="importBtn" type="button" title="Import fleet data">📤 Import</button>
+        <div id="subIndicator" class="badge">Unknown</div>
+        <button id="checkSubBtn" type="button">Check Status</button>
+        <div id="storageIndicator" class="badge">Storage</div>
+      </div>
+    </header>
+    <main class="layout">
+      <aside class="panel">
+        <div class="tabs">
+          <button class="tab active" data-tab="home">Home</button>
+          <button class="tab" data-tab="drones">Drones</button>
+          <button class="tab" data-tab="pilots">Pilots</button>
+          <button class="tab" data-tab="missions">Missions</button>
+          <button class="tab" data-tab="maintenance">Maintenance</button>
+          <button class="tab" data-tab="documents">Documents</button>
+          <button class="tab" data-tab="analytics">Analytics</button>
+          <button class="tab" data-tab="telemetry">Telemetry</button>
+          <button class="tab" data-tab="incidents">Incidents</button>
+          <button class="tab" data-tab="alerts">Alerts</button>
+          <button class="tab" data-tab="admin">Admin</button>
+          <button class="tab" data-tab="portal">Pilot Portal</button>
+        </div>
+
+        <!-- HOME TAB -->
+        <section id="home" class="tabcontent active">
+          <h3>Welcome</h3>
+          <div class="item">
+            <strong>Login</strong>
+            <div class="small">Pilots log in here to access their portal.</div>
+          </div>
+          <form id="loginForm" class="form">
+            <h3>Pilot Login</h3>
+            <input name="license" placeholder="License Number or Username" required>
+            <input name="password" type="password" placeholder="Password" required>
+            <button type="submit">🔐 Login</button>
+          </form>
+          <div id="loginMsg" class="small" style="margin-top:6px; color:#b9c4d4;"></div>
+          <div class="item">
+            <div class="small">Admins can manage pilot access from the Admin tab.</div>
+          </div>
+          <form id="pilotApplyForm" class="form">
+            <h3>Pilot Registration</h3>
+            <input name="name" placeholder="Full Name" required>
+            <input name="license" placeholder="License Number" required>
+            <input name="licenseExpiry" type="date" placeholder="License Expiry" required>
+            <input name="contact" placeholder="Contact Number" required>
+            <input name="homeBase" placeholder="Home Base" required>
+            <input name="username" placeholder="Desired Username" required>
+            <input name="password" type="password" placeholder="Desired Password" required>
+            <button type="submit">📝 Apply for Registration</button>
+          </form>
+          <div id="applyMsg" class="small" style="margin-top:6px; color:#b9c4d4;"></div>
+        </section>
+
+        <!-- DRONES TAB -->
+        <section id="drones" class="tabcontent">
+          <form id="droneForm" class="form">
+            <h3>Add/Edit Drone</h3>
+            <input name="name" placeholder="Drone Name" required>
+            <input name="model" placeholder="Model" required>
+            <input name="serialNumber" placeholder="Serial Number">
+            <select name="status">
+              <option value="idle">Idle</option>
+              <option value="active">Active</option>
+              <option value="maintenance">Maintenance</option>
+              <option value="retired">Retired</option>
+            </select>
+            <input name="battery" type="number" placeholder="Battery %" min="0" max="100" value="100">
+            <input name="batteryCycles" type="number" placeholder="Cycle Count" min="0" value="0">
+            <input name="batteryHealth" type="number" placeholder="Health %" min="0" max="100" value="100">
+            <input name="flightHours" type="number" placeholder="Flight Hours" min="0" value="0">
+            <input name="maxFlightTime" type="number" placeholder="Max Flight Time (min)" min="0" value="40">
+            <select name="maintenanceStatus">
+              <option value="operational">Operational</option>
+              <option value="maintenance-due">Maintenance Due</option>
+              <option value="grounded">Grounded</option>
+            </select>
+            <select name="pilotId" id="dronePilotSelect"></select>
+            <button type="submit">💾 Save Drone</button>
+          </form>
+          <div id="droneList" class="list"></div>
+        </section>
+
+        <!-- PILOTS TAB -->
+        <section id="pilots" class="tabcontent">
+          <form id="pilotForm" class="form">
+            <h3>Add/Edit Pilot</h3>
+            <input name="name" placeholder="Full Name" required>
+            <input name="license" placeholder="License Number" required>
+            <input name="licenseExpiry" type="date" placeholder="License Expiry" required>
+            <input name="contact" placeholder="Contact Number" required>
+            <input name="homeBase" placeholder="Home Base" required>
+            <input name="flightHours" type="number" placeholder="Flight Hours" min="0" value="0">
+            <select name="status">
+              <option value="active">Active</option>
+              <option value="inactive">Inactive</option>
+              <option value="on-leave">On Leave</option>
+              <option value="retired">Retired</option>
+            </select>
+            <input name="loginUsername" placeholder="Pilot Username (optional)">
+            <input name="loginPassword" type="password" placeholder="Pilot Password (optional)">
+            <label class="small"><input type="checkbox" name="loginActive" checked> Allow Pilot Login</label>
+            <button type="submit">💾 Save Pilot</button>
+          </form>
+          <div id="pilotList" class="list"></div>
+        </section>
+
+        <!-- MISSIONS TAB -->
+        <section id="missions" class="tabcontent">
+          <form id="missionForm" class="form">
+            <h3>Schedule Mission</h3>
+            <input name="title" placeholder="Mission Title" required>
+            <input name="location" placeholder="Location/Area">
+            <select name="droneId" id="missionDroneSelect" required></select>
+            <select name="pilotId" id="missionPilotSelect" required></select>
+            <select name="type">
+              <option value="survey">Survey</option>
+              <option value="inspection">Inspection</option>
+              <option value="mapping">Mapping</option>
+              <option value="delivery">Delivery</option>
+              <option value="monitoring">Monitoring</option>
+              <option value="training">Training</option>
+            </select>
+            <input name="startTime" type="datetime-local" required>
+            <input name="endTime" type="datetime-local" required>
+            <input name="duration" type="number" placeholder="Duration (minutes)" min="1" value="60">
+            <select name="status">
+              <option value="pending">Pending</option>
+              <option value="approved">Approved</option>
+              <option value="in-progress">In Progress</option>
+              <option value="completed">Completed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <textarea name="notes" placeholder="Mission Notes" rows="2"></textarea>
+            <div class="form-row">
+              <label class="small">Import Telemetry: <input type="file" id="telemetryImport" accept=".csv"
+                  style="display:inline-block; width:auto;"></label>
+            </div>
+            <button type="submit">🎯 Schedule Mission</button>
+          </form>
+          <form id="pilotMissionForm" class="form" style="display:none;">
+            <h3>File Mission Request</h3>
+            <input name="title" placeholder="Mission Title" required>
+            <input name="location" placeholder="Location/Area" required>
+            <input name="startTime" type="datetime-local" required>
+            <input name="endTime" type="datetime-local" required>
+            <textarea name="notes" placeholder="Notes" rows="2"></textarea>
+            <button type="submit">📝 Submit Mission</button>
+          </form>
+          <div id="missionList" class="list"></div>
+        </section>
+
+        <!-- MAINTENANCE TAB -->
+        <section id="maintenance" class="tabcontent">
+          <form id="maintenanceForm" class="form">
+            <h3>Schedule Maintenance</h3>
+            <select name="droneId" id="maintDroneSelect" required></select>
+            <input name="title" placeholder="Task Description" required>
+            <select name="type">
+              <option value="routine">Routine</option>
+              <option value="airframe">Airframe</option>
+              <option value="battery">Battery</option>
+              <option value="firmware">Firmware</option>
+              <option value="propellers">Propellers</option>
+              <option value="sensors">Sensors</option>
+              <option value="calibration">Calibration</option>
+              <option value="inspection">Inspection</option>
+            </select>
+            <input name="dueDate" type="date" required>
+            <select name="status">
+              <option value="scheduled">Scheduled</option>
+              <option value="in-progress">In Progress</option>
+              <option value="completed">Completed</option>
+              <option value="due-soon">Due Soon</option>
+              <option value="overdue">Overdue</option>
+            </select>
+            <input name="estimatedCost" type="number" placeholder="Estimated Cost ($)" min="0">
+            <input name="technician" placeholder="Assigned Technician">
+            <textarea name="notes" placeholder="Notes" rows="2"></textarea>
+            <button type="submit">🔧 Save Maintenance</button>
+          </form>
+          <div id="maintenanceList" class="list"></div>
+        </section>
+
+        <!-- DOCUMENTS TAB -->
+        <section id="documents" class="tabcontent">
+          <form id="documentForm" class="form">
+            <h3>Upload Document</h3>
+            <select name="pilotId" id="docPilotSelect"></select>
+            <input name="type" placeholder="Document Type (License, Certificate, etc.)" required>
+            <input name="number" placeholder="Reference/Number" required>
+            <input name="issueDate" type="date" required>
+            <input name="expiryDate" type="date" required>
+            <select name="status">
+              <option value="valid">Valid</option>
+              <option value="expiring">Expiring Soon</option>
+              <option value="expired">Expired</option>
+              <option value="pending">Pending</option>
+            </select>
+            <input name="file" type="file" accept="application/pdf,image/*">
+            <button type="submit">📄 Save Document</button>
+          </form>
+          <form id="pilotDocumentForm" class="form" style="display:none;">
+            <h3>Upload My Documents</h3>
+            <select name="type" required>
+              <option value="License">License</option>
+              <option value="Medical">Medical</option>
+            </select>
+            <input name="number" placeholder="Reference/Number" required>
+            <input name="issueDate" type="date" required>
+            <input name="expiryDate" type="date" required>
+            <input name="file" type="file" accept="application/pdf,image/*">
+            <button type="submit">📄 Save Document</button>
+          </form>
+          <div id="documentList" class="list"></div>
+        </section>
+
+        <!-- INCIDENTS TAB -->
+        <section id="incidents" class="tabcontent">
+          <form id="incidentForm" class="form">
+            <h3>Report Incident</h3>
+            <input name="title" placeholder="Incident Title" required>
+            <input name="date" type="date" required>
+            <input name="location" placeholder="Location">
+            <select name="severity">
+              <option value="minor">Minor</option>
+              <option value="major">Major</option>
+              <option value="critical">Critical</option>
+            </select>
+            <select name="droneId" class="drone-select-dynamic"></select>
+            <select name="pilotId" class="pilot-select-dynamic"></select>
+            <textarea name="description" placeholder="Description / Narrative" rows="3" required></textarea>
+            <button type="submit">⚠️ Log Incident</button>
+          </form>
+          <div id="incidentList" class="list"></div>
+        </section>
+
+        <!-- ANALYTICS TAB -->
+        <section id="analytics" class="tabcontent">
+          <h3>Fleet Analytics</h3>
+          <div id="analyticsContainer" class="analytics-section"></div>
+        </section>
+
+        <!-- ALERTS TAB -->
+        <section id="alerts" class="tabcontent">
+          <div class="form" style="margin-bottom:12px;">
+            <input id="alertSearch" placeholder="🔍 Filter alerts...">
+          </div>
+          <div id="alertsList" class="list"></div>
+        </section>
+
+        <!-- TELEMETRY TAB -->
+        <section id="telemetry" class="tabcontent">
+          <h3>Live Telemetry Feed</h3>
+          <div class="form" style="margin-bottom:12px;">
+            <input id="wsUrl" placeholder="ws://localhost:8081" value="ws://localhost:8081">
+            <button id="connectWs" type="button">🔌 WebSocket</button>
+            <button id="disconnectWs" type="button">⏹ Disconnect</button>
+            <button id="pollHttpBtn" type="button">📡 Poll HTTP</button>
+            <button id="stopPollBtn" type="button" style="display:none;">⏹ Stop Poll</button>
+            <div id="wsStatus" class="badge">Disconnected</div>
+          </div>
+          <div id="telemetryFeed"
+            style="height:600px;overflow-y:auto;background:#0a1729;border-radius:8px;padding:8px;"></div>
+        </section>
+
+        <!-- ADMIN TAB -->
+        <section id="admin" class="tabcontent">
+          <h3>Admin</h3>
+          <form id="adminLoginForm" class="form">
+            <h3>Admin Login</h3>
+            <input name="username" placeholder="Username" required>
+            <input name="password" type="password" placeholder="Password" required>
+            <button type="submit">🔐 Admin Login</button>
+          </form>
+          <div id="adminWelcome" class="item" style="display:none;"></div>
+          <div style="margin-top:8px;">
+            <button id="adminLogoutBtn" type="button" style="display:none;">Admin Logout</button>
+          </div>
+          <form id="pilotAccessForm" class="form" style="display:none;">
+            <h3>Manage Pilot Logins</h3>
+            <select name="pilotId" class="pilot-select-dynamic" required></select>
+            <input name="username" placeholder="Username (optional)">
+            <input name="password" type="password" placeholder="Set/Reset Password" required>
+            <label class="small"><input type="checkbox" name="active" checked> Allow Pilot Login</label>
+            <button type="submit">✅ Save Pilot Access</button>
+          </form>
+          <div id="pilotApplyList" class="list" style="display:none;"></div>
+          <div id="pilotAccessList" class="list" style="display:none;"></div>
+        </section>
+
+        <!-- PILOT PORTAL -->
+        <section id="portal" class="tabcontent">
+          <h3>Pilot Portal</h3>
+          <div id="pilotWelcome" class="item" style="display:none;"></div>
+          <div class="item" id="pilotFollowWrap" style="display:none;">
+            <label><input type="checkbox" id="followMissionToggle"> Follow my live mission on map</label>
+          </div>
+          <form id="flightPlanForm" class="form" style="display:none;">
+            <h3>File Flight Plan</h3>
+            <input name="title" placeholder="Plan Title" required>
+            <input name="location" placeholder="Location/Area" required>
+            <input name="startTime" type="datetime-local" required>
+            <input name="endTime" type="datetime-local" required>
+            <textarea name="notes" placeholder="Notes" rows="2"></textarea>
+            <button type="submit">✈️ File Flight Plan</button>
+          </form>
+          <form id="pilotDocForm" class="form" style="display:none;">
+            <h3>Upload My Documents</h3>
+            <select name="type" required>
+              <option value="License">License</option>
+              <option value="Medical">Medical</option>
+            </select>
+            <input name="number" placeholder="Reference/Number" required>
+            <input name="issueDate" type="date" required>
+            <input name="expiryDate" type="date" required>
+            <input name="file" type="file" accept="application/pdf,image/*">
+            <button type="submit">📄 Save Document</button>
+          </form>
+          <div id="pilotDocumentList" class="list" style="display:none;"></div>
+          <div id="flightPlanList" class="list" style="display:none;"></div>
+          <h3 style="margin-top:8px;">My Missions</h3>
+          <div id="pilotMissionList" class="list" style="display:none;"></div>
+          <div style="margin-top:8px;">
+            <button id="logoutBtn" type="button" style="display:none;">Logout</button>
+          </div>
+        </section>
+      </aside>
+
+      <!-- MAP SECTION -->
+      <section class="mapwrap">
+        <div class="legend">
+          <div><span class="dot dot-active"></span> Active</div>
+          <div><span class="dot dot-idle"></span> Idle</div>
+          <div><span class="dot dot-maintenance"></span> Maintenance</div>
+          <div style="margin-top:8px; font-size:0.85rem; color:#666;">
+            Right-click on map for more options
+          </div>
+        </div>
+        <div id="map"></div>
+      </section>
+    </main>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="config.js"></script>
+  <script src="main.js?v=3"></script>
+</body>
+
+</html>

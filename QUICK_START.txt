@@ -1,0 +1,1855 @@
+19640612// STATE
+const state = {
+  drones: [],
+  pilots: [],
+  pilotAccounts: [],
+  adminUsers: [{ username: "admin", password: "admin123" }],
+  pilotApplications: [],
+  missions: [],
+  maintenance: [],
+  documents: [],
+  incidents: [],
+  positions: {},
+  markers: {},
+  tracks: {},
+  polylines: {},
+  telemetry: [],
+  activeMissionId: null,
+  analytics: { totalFlightHours: 0, totalMissions: 0, operationalEfficiency: 94 },
+  adminAuth: { isAdmin: false, username: "" }
+};
+
+const storage = {
+  ok: true,
+  get() {
+    try {
+      const s = sessionStorage.getItem("sentinel");
+      console.log("📦 Loading from sessionStorage:", s ? JSON.parse(s).pilots.map(p => p.name) : "empty");
+      return s ? JSON.parse(s) : null;
+    } catch (e) {
+      console.error("❌ Storage GET error:", e);
+      this.ok = false;
+      return null;
+    }
+  },
+  set(v) {
+    try {
+      sessionStorage.setItem("sentinel", JSON.stringify(v));
+      console.log("💾 Saved to sessionStorage:", v.pilots.map(p => p.name));
+      this.ok = true;
+      return Promise.resolve();
+    } catch (e) {
+      console.error("❌ Storage SET error:", e);
+      this.ok = false;
+      return Promise.resolve();
+    }
+  }
+};
+
+// WS STATE
+let ws = null;
+let wsConnected = false;
+let httpPollInterval = null;
+
+function setWsStatus(txt) {
+  const elStatus = el('#wsStatus');
+  if (!elStatus) return;
+  elStatus.textContent = txt;
+  if (txt === 'Connected') elStatus.className = 'badge valid';
+  else if (txt === 'Polling') elStatus.className = 'badge warning';
+  else elStatus.className = 'badge expired';
+}
+
+function disconnectWs() {
+  if (ws) { try { ws.close(); } catch (_) { } }
+  ws = null;
+  wsConnected = false;
+  setWsStatus('Disconnected');
+}
+
+function applyTelemetryItems(items) {
+  if (!Array.isArray(items) || items.length === 0) return false;
+  items.forEach(m => {
+    if (!m || !m.droneId || typeof m.lat !== 'number' || typeof m.lon !== 'number') return;
+    const d0 = state.drones.find(d => d.id === m.droneId);
+    if (!d0) {
+      state.drones.push({ id: m.droneId, name: m.name || `Drone-${m.droneId.slice(0, 4)}`, model: m.model || 'N/A', status: m.status || 'active', battery: typeof m.battery === 'number' ? m.battery : 100, pilotId: null });
+      renderDrones(); refreshSelects();
+    } else {
+      if (m.status) d0.status = m.status;
+      if (typeof m.battery === 'number') d0.battery = m.battery;
+    }
+    state.positions[m.droneId] = { lat: m.lat, lon: m.lon };
+    const idx = state.telemetry.findIndex(t => t.droneId === m.droneId);
+    const t = { droneId: m.droneId, lat: m.lat, lon: m.lon, battery: m.battery ?? (d0 ? d0.battery : 0), speed: m.speed ?? 0, altitude: m.altitude ?? 0, signal: m.signal ?? 100, timestamp: new Date().toLocaleTimeString() };
+    if (idx >= 0) state.telemetry[idx] = t; else state.telemetry.push(t);
+    if (!state.tracks[m.droneId]) state.tracks[m.droneId] = [];
+    state.tracks[m.droneId].push([m.lat, m.lon]);
+    if (state.tracks[m.droneId].length > 500) state.tracks[m.droneId].shift();
+    updatePolyline(m.droneId);
+  });
+  syncMarkers();
+  renderTelemetryFeed();
+  return true;
+}
+
+function startHttpPoll() {
+  if (httpPollInterval) return;
+  stopHttpPoll();        // clear any stale interval first
+  setWsStatus('Polling');
+  const stopBtn = el('#stopPollBtn');
+  const startBtn = el('#pollHttpBtn');
+  if (stopBtn) stopBtn.style.display = 'inline-block';
+  if (startBtn) startBtn.style.display = 'none';
+
+  const doPoll = () => {
+    apiGet('/telemetry').then(items => {
+      applyTelemetryItems(items);
+    });
+  };
+  doPoll();
+  httpPollInterval = setInterval(doPoll, 2000);
+}
+
+function stopHttpPoll() {
+  if (httpPollInterval) { clearInterval(httpPollInterval); httpPollInterval = null; }
+  const stopBtn = el('#stopPollBtn');
+  const startBtn = el('#pollHttpBtn');
+  if (stopBtn) stopBtn.style.display = 'none';
+  if (startBtn) startBtn.style.display = 'inline-block';
+  setWsStatus('Disconnected');
+}
+function connectWs(url) {
+  try {
+    disconnectWs();
+    setWsStatus('Connecting...');
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      wsConnected = true;
+      setWsStatus('Connected');
+      apiGet('/telemetry').then(items => {
+        const applied = applyTelemetryItems(items);
+        if (!applied && state.drones.length) {
+          state.drones.forEach(d => updateTelemetry(d.id));
+          syncMarkers();
+          renderTelemetryFeed();
+        }
+      });
+    };
+    ws.onclose = () => { wsConnected = false; setWsStatus('Disconnected'); };
+    ws.onerror = () => { wsConnected = false; setWsStatus('Error'); };
+    ws.onmessage = (e) => {
+      let msg; try { msg = JSON.parse(e.data); } catch (_) { return }
+      const items = Array.isArray(msg) ? msg : [msg];
+      applyTelemetryItems(items);
+    };
+  } catch (_) {
+    setWsStatus('Error');
+  }
+}
+
+// Modal helpers
+function showModal(title, bodyHtml, footerHtml) {
+  const modal = document.getElementById('modal'); if (!modal) return;
+  const t = document.getElementById('modalTitle'); if (t) t.textContent = title || 'Dialog';
+  const b = document.getElementById('modalBody'); if (b) b.innerHTML = bodyHtml || '';
+  const f = document.getElementById('modalFooter'); if (f) f.innerHTML = footerHtml || '';
+  modal.hidden = false;
+}
+function hideModal() { const modal = document.getElementById('modal'); if (modal) modal.hidden = true; }
+
+const id = () => Math.random().toString(36).slice(2, 10);
+const el = (q) => document.querySelector(q);
+const els = (q) => Array.from(document.querySelectorAll(q));
+const isPilotOnly = () => state.auth.isPilot && !state.adminAuth.isAdmin;
+function setLoginMessage(text, isError = false) {
+  const msg = el('#loginMsg');
+  if (!msg) return;
+  msg.textContent = text || '';
+  msg.style.color = isError ? '#f39c12' : '#2ecc71';
+}
+function setApplyMessage(text, isError = false) {
+  const msg = el('#applyMsg');
+  if (!msg) return;
+  msg.textContent = text || '';
+  msg.style.color = isError ? '#f39c12' : '#2ecc71';
+}
+function snapshot() {
+  return {
+    drones: state.drones,
+    pilots: state.pilots,
+    pilotAccounts: state.pilotAccounts,
+    adminUsers: state.adminUsers,
+    pilotApplications: state.pilotApplications,
+    missions: state.missions,
+    maintenance: state.maintenance,
+    documents: state.documents,
+    incidents: state.incidents || [],
+    positions: state.positions,
+    subscription: state.subscription
+  };
+}
+const persist = () => storage.set(snapshot());
+state.auth = {
+  token: sessionStorage.getItem('sentinel_token') || '',
+  pilotId: sessionStorage.getItem('sentinel_pilotId') || '',
+  isPilot: sessionStorage.getItem('sentinel_isPilot') === 'true'
+};
+state.adminAuth = {
+  isAdmin: sessionStorage.getItem('sentinel_isAdmin') === 'true',
+  username: sessionStorage.getItem('sentinel_adminUser') || ''
+};
+const API_HOST = (window.SENTINEL_API_HOST || window.location.hostname || 'localhost').replace(/\/$/, '');
+const API_BASE = `http://${API_HOST}:8080/api`;
+
+const apiGet = (path) => fetch(`${API_BASE}${path}`).then(r => r.json()).catch(() => null);
+const apiPost = (path, body) => fetch(`${API_BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()).catch(() => null);
+const apiPut = (path, body) => fetch(`${API_BASE}${path}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()).catch(() => null);
+const apiDelete = (path) => fetch(`${API_BASE}${path}`, { method: 'DELETE' }).then(r => r.json()).catch(() => null);
+
+async function apiGetAuth(path) { try { const r = await fetch(`${API_BASE}${path}`, { headers: { 'Authorization': `Bearer ${state.auth.token}` } }); return await r.json(); } catch (e) { return null } }
+async function apiPostAuth(path, body) { try { const r = await fetch(`${API_BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.auth.token}` }, body: JSON.stringify(body) }); return await r.json(); } catch (e) { return null } }
+async function apiDeleteAuth(path) { try { const r = await fetch(`${API_BASE}${path}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${state.auth.token}` } }); return await r.json(); } catch (e) { return null } }
+
+async function fetchFlightPlans() { if (!state.auth.token) return []; const fps = await apiGetAuth('/flightplans'); return Array.isArray(fps) ? fps : [] }
+function renderFlightPlans(list) { const fpList = el('#flightPlanList'); if (!fpList) return; fpList.style.display = 'block'; fpList.innerHTML = ''; if (!list.length) { fpList.innerHTML = '<div style="color:#b9c4d4;padding:12px;">No flight plans</div>'; return } list.forEach(x => { const it = document.createElement('div'); it.className = 'item'; it.innerHTML = `<div class="row"><strong>${x.title}</strong><span class="small">${x.location || ''}</span></div><div class="row"><span class="small">${x.startTime} → ${x.endTime}</span><div><button class="del-fp" data-id="${x.id}">🗑️ Delete</button></div></div>`; fpList.appendChild(it) }); els('.del-fp').forEach(b => b.onclick = (e) => { e.preventDefault(); const id = b.dataset.id; apiDeleteAuth(`/flightplans/${id}`).then(() => fetchFlightPlans().then(renderFlightPlans)) }); }
+function renderPilotMissions() { const list = el('#pilotMissionList'); if (!list) return; const pid = state.auth.pilotId; const missions = state.missions.filter(m => m.pilotId === pid); list.style.display = 'block'; list.innerHTML = ''; if (!missions.length) { list.innerHTML = '<div style="color:#b9c4d4;padding:12px;">No missions assigned</div>'; return } missions.forEach(m => { const d = state.drones.find(x => x.id === m.droneId); const it = document.createElement('div'); it.className = 'item'; it.innerHTML = `<div class="row"><strong>${m.title}</strong><span class="badge ${m.status}">${m.status.toUpperCase()}</span></div><div class="small">Drone: ${d ? d.name : 'N/A'}</div>`; list.appendChild(it) }); }
+async function fetchPilotDocuments() { if (!state.auth.token) return []; const docs = await apiGetAuth('/documents'); return Array.isArray(docs) ? docs : [] }
+function renderPilotDocuments(list) {
+  const docList = el('#pilotDocumentList');
+  if (!docList) return;
+  const pid = state.auth.pilotId;
+  const docs = (Array.isArray(list) ? list : state.documents).filter(d => d.pilotId === pid);
+  docList.style.display = 'block';
+  docList.innerHTML = '';
+  if (!docs.length) {
+    docList.innerHTML = '<div style="color:#b9c4d4;padding:12px;">No documents uploaded</div>';
+    return;
+  }
+  docs.forEach(d => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `<div class="row"><strong>${d.type}</strong><span class="badge ${d.status}">${d.status.toUpperCase()}</span></div><div class="small">Ref: ${d.number} • Expires: ${d.expiryDate || 'N/A'}</div>`;
+    docList.appendChild(item);
+  });
+}
+function updateSyncStatus(status, message) {
+  const ind = el('#subIndicator');
+  if (!ind) return;
+  ind.textContent = message || status;
+  ind.className = 'badge ' + (status === 'Synced' ? 'valid' : status === 'Syncing' ? 'warning' : 'expired');
+}
+
+async function syncToCloud() {
+  updateSyncStatus('Syncing', '☁️ Syncing...');
+  try {
+    const fullState = snapshot();
+    // Since the server handles individual resources but we want a full "Cloud Sync"
+    // we will push all current local state to their respective endpoints.
+    // In a real production app, we might have a single /api/sync endpoint.
+    const promises = [
+      ...state.drones.map(d => apiPost('/drones', d)),
+      ...state.pilots.map(p => apiPost('/pilots', p)),
+      ...state.missions.map(m => apiPost('/missions', m)),
+      ...state.maintenance.map(ma => apiPost('/maintenance', ma)),
+      ...state.documents.map(doc => apiPost('/documents', doc))
+    ];
+    await Promise.all(promises);
+    updateSyncStatus('Synced', '☁️ Cloud Synced');
+    setTimeout(() => updateSyncStatus('Synced', 'Verified'), 3000);
+  } catch (e) {
+    console.error("❌ Cloud Sync Error:", e);
+    updateSyncStatus('Error', '❌ Sync Failed');
+  }
+}
+
+async function syncFromServer() {
+  updateSyncStatus('Syncing', '☁️ Downloading...');
+  try {
+    const d = await apiGet('/drones');
+    const p = await apiGet('/pilots');
+    const m = await apiGet('/missions');
+    const mt = await apiGet('/maintenance');
+    const dc = await apiGet('/documents');
+    const sub = await apiGet('/subscription');
+
+    // Simple merge logic: server wins only when non-empty
+    if (Array.isArray(d) && d.length) state.drones = d;
+    if (Array.isArray(p) && p.length) state.pilots = p;
+    if (Array.isArray(m) && m.length) state.missions = m;
+    if (Array.isArray(mt) && mt.length) state.maintenance = mt;
+    if (Array.isArray(dc) && dc.length) state.documents = dc;
+    if (sub) state.subscription = sub;
+
+    persist();
+    renderAll(); // Helper to re-render everything
+    updateSyncStatus('Synced', '☁️ Up to Date');
+  } catch (e) {
+    console.error("❌ Sync From Server Error:", e);
+    updateSyncStatus('Error', '❌ Load Failed');
+  }
+}
+
+function renderAll() {
+  renderPilots();
+  renderDrones();
+  renderMissions();
+  renderMaintenance();
+  renderDocuments();
+  renderAnalytics();
+  renderAlerts();
+  refreshSelects();
+  syncMarkers();
+}
+
+function setActiveTab(tabId) {
+  els(".tab").forEach(t => t.classList.remove("active"));
+  els(".tabcontent").forEach(tc => tc.classList.remove("active"));
+  const tab = el(`.tab[data-tab="${tabId}"]`);
+  const content = el(`#${tabId}`);
+  if (tab) tab.classList.add("active");
+  if (content) content.classList.add("active");
+}
+
+function setAdminTabsVisible(isAdmin) {
+  const adminOnly = ["drones", "pilots", "missions", "maintenance", "documents", "analytics", "telemetry", "incidents", "alerts"];
+  adminOnly.forEach(id => {
+    const tab = el(`.tab[data-tab="${id}"]`);
+    if (tab) tab.style.display = isAdmin ? "" : "none";
+  });
+}
+
+function setPilotPortalAccess(isPilot) {
+  const portalTab = el(`.tab[data-tab="portal"]`);
+  const homeTab = el(`.tab[data-tab="home"]`);
+  const adminTab = el(`.tab[data-tab="admin"]`);
+  const missionsTab = el(`.tab[data-tab="missions"]`);
+  const documentsTab = el(`.tab[data-tab="documents"]`);
+  const incidentsTab = el(`.tab[data-tab="incidents"]`);
+  const mapWrap = el('.mapwrap');
+  const isAdmin = !!state.adminAuth.isAdmin;
+  const pilotOnly = isPilot && !isAdmin;
+
+  if (portalTab) portalTab.style.display = (isPilot || isAdmin) ? "" : "none";
+  if (homeTab) homeTab.style.display = pilotOnly ? "none" : "";
+
+  if (pilotOnly) {
+    // ── PILOT logged in (non-admin): only allow Documents + Missions + Incidents ────
+    if (adminTab) adminTab.style.display = "none";
+    setAdminTabsVisible(false);
+    if (portalTab) portalTab.style.display = "none";
+    if (missionsTab) missionsTab.style.display = "";
+    if (documentsTab) documentsTab.style.display = "";
+    if (incidentsTab) incidentsTab.style.display = "";
+    // Hide all other tabs for pilot-only sessions
+    ["home", "drones", "pilots", "maintenance", "analytics", "telemetry", "alerts", "admin", "portal"].forEach(id => {
+      const tab = el(`.tab[data-tab="${id}"]`);
+      if (tab) tab.style.display = "none";
+    });
+    setActiveTab("missions");
+
+    // Hide the live map panel so pilots cannot track drone positions
+    if (mapWrap) mapWrap.style.display = "none";
+
+    // Remove all drone markers from the map to prevent position leaking
+    if (map) {
+      Object.values(state.markers).forEach(m => { try { m.remove(); } catch (_) { } });
+      state.markers = {};
+      Object.values(state.polylines).forEach(p => {
+        try { if (p && p.remove) p.remove(); else if (p && p.routeLine) p.routeLine.remove(); } catch (_) { }
+      });
+      state.polylines = {};
+      state.tracks = {};
+    }
+  } else {
+    // ── PILOT logged out OR admin override: keep full admin access ──────
+    if (adminTab) adminTab.style.display = "";
+    // Restore non-admin tabs visibility
+    ["home", "drones", "pilots", "missions", "maintenance", "documents", "analytics", "telemetry", "incidents", "alerts", "admin", "portal"].forEach(id => {
+      const tab = el(`.tab[data-tab="${id}"]`);
+      if (tab) tab.style.display = "";
+    });
+    setAdminTabsVisible(isAdmin);
+    if (!isPilot) setActiveTab(isAdmin ? "drones" : "home");
+
+    // Restore the live map panel
+    if (mapWrap) mapWrap.style.display = "";
+
+    // Re-populate drone markers on the map
+    syncMarkers();
+  }
+}
+
+function setAdminPortalAccess(isAdmin) {
+  const adminForm = el('#adminLoginForm');
+  const adminWelcome = el('#adminWelcome');
+  const adminLogout = el('#adminLogoutBtn');
+  const accessForm = el('#pilotAccessForm');
+  const accessList = el('#pilotAccessList');
+  const applyList = el('#pilotApplyList');
+  const portalTab = el(`.tab[data-tab="portal"]`);
+
+  if (adminForm) adminForm.style.display = isAdmin ? 'none' : 'block';
+  if (adminWelcome) {
+    adminWelcome.style.display = isAdmin ? 'block' : 'none';
+    adminWelcome.textContent = isAdmin ? `Logged in as Admin ${state.adminAuth.username || ''}`.trim() : '';
+  }
+  if (adminLogout) adminLogout.style.display = isAdmin ? 'inline-block' : 'none';
+  if (accessForm) accessForm.style.display = isAdmin ? 'grid' : 'none';
+  if (accessList) accessList.style.display = isAdmin ? 'block' : 'none';
+  if (applyList) applyList.style.display = isAdmin ? 'block' : 'none';
+
+  if (portalTab) portalTab.style.display = (isAdmin || state.auth.isPilot) ? "" : "none";
+  if (isAdmin) { renderPilotAccessList(); renderPilotApplications(); }
+  setAdminTabsVisible(isAdmin);
+}
+
+// INITIALIZATION
+function initData() {
+  const saved = storage.get();
+  console.log("🔍 initData() - saved data exists:", !!saved, "pilots:", saved?.pilots?.length, "drones:", saved?.drones?.length);
+
+  if (saved && saved.pilots && saved.pilots.length > 0 && saved.drones && saved.drones.length > 0) {
+    console.log("✅ Loading saved data");
+    Object.assign(state, saved);
+    if (!Array.isArray(state.pilotAccounts)) state.pilotAccounts = [];
+    if (!Array.isArray(state.pilotApplications)) state.pilotApplications = [];
+    if (!Array.isArray(state.adminUsers) || state.adminUsers.length === 0) {
+      state.adminUsers = [{ username: "admin", password: "admin123" }];
+    }
+  } else if (!saved) {
+    console.log("⚙️ Creating defaults (no saved data)");
+    const p1 = { id: id(), name: "Marius Muller", license: "RPL-1023", contact: "+27 82 000 0001", homeBase: "Cape Town", licenseExpiry: "2026-12-01", flightHours: 450, status: "active" };
+    const p2 = { id: id(), name: "Gerhard Faber", license: "RPL-1044", contact: "+27 82 000 0002", homeBase: "Johannesburg", licenseExpiry: "2025-06-01", flightHours: 320, status: "active" };
+    state.pilots = [p1, p2];
+    state.drones = [
+      { id: id(), name: "Eagle-1", model: "DJI Mavic 3", status: "active", battery: 92, batteryCycles: 45, batteryHealth: 98, pilotId: p1.id, serialNumber: "1AJKD-M3-2024-001" },
+      { id: id(), name: "Kudu-7", model: "Autel Evo II", status: "active", battery: 100, batteryCycles: 12, batteryHealth: 100, pilotId: null, serialNumber: "AU-EVO2-2024-002" },
+      { id: id(), name: "Phoenix-3", model: "Freefly Alta X", status: "active", battery: 85, batteryCycles: 156, batteryHealth: 88, pilotId: p2.id, serialNumber: "FF-ALX-2024-003" }
+    ];
+    state.pilotAccounts = [];
+    state.pilotApplications = [];
+    persist();
+  } else {
+    console.log("⚠️ Partial saved data, keeping current state");
+    if (!Array.isArray(state.pilotAccounts)) state.pilotAccounts = [];
+    if (!Array.isArray(state.pilotApplications)) state.pilotApplications = [];
+    if (!Array.isArray(state.adminUsers) || state.adminUsers.length === 0) {
+      state.adminUsers = [{ username: "admin", password: "admin123" }];
+    }
+  }
+}
+
+// MAP
+const SA = { latMin: -35, latMax: -22, lonMin: 16, lonMax: 33, center: [-28.5, 24.7], zoom: 5.8 };
+let map;
+
+function initMap() {
+  if (!el("#map")) return;
+  if (!hasLeaflet()) {
+    const m = el('#map');
+    m.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#b9c4d4;font-size:14px;text-align:center;">Map unavailable. Check network access to Leaflet CDN or continue using the left panel.</div>';
+    return;
+  }
+  map = L.map("map", { zoomControl: true }).setView(SA.center, SA.zoom);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap"
+  }).addTo(map);
+  console.log("✓ Map ready");
+}
+
+function getPosition(droneId) {
+  if (!state.positions[droneId]) {
+    state.positions[droneId] = {
+      lat: -35 + Math.random() * 13,
+      lon: 16 + Math.random() * 17
+    };
+  }
+  return state.positions[droneId];
+}
+
+function markerColor(status) {
+  return status === "active" ? "#2ecc71" : status === "idle" ? "#2d6cdf" : "#d7263d";
+}
+
+function hasLeaflet() { return typeof L !== 'undefined'; }
+
+function iconFor(status) {
+  if (!hasLeaflet()) return null;
+  const html = `<svg width="26" height="26" viewBox="0 0 26 26"><circle cx="13" cy="13" r="11" fill="${markerColor(status)}" opacity="0.15"/><circle cx="13" cy="13" r="6" fill="${markerColor(status)}"/></svg>`;
+  return L.divIcon({ className: "", html, iconSize: [26, 26], iconAnchor: [13, 13] });
+}
+function labelFor(drone) { return `${drone.name}`; }
+
+function syncMarkers() {
+  if (!hasLeaflet() || !map) return;
+  state.drones.forEach(d => {
+    const pos = getPosition(d.id);
+    const telem = getTelemetry(d.id);
+    if (state.markers[d.id]) {
+      state.markers[d.id].setLatLng([pos.lat, pos.lon]);
+      const icon = iconFor(d.status); if (icon) state.markers[d.id].setIcon(icon);
+      state.markers[d.id].setPopupContent(`<strong>${d.name}</strong><br/>${d.model}<br/>Battery ${d.battery}%<br/>Speed: ${telem.speed} km/h<br/>Altitude: ${telem.altitude}m`);
+      const tt = state.markers[d.id].getTooltip();
+      if (tt) tt.setContent(labelFor(d)); else state.markers[d.id].bindTooltip(labelFor(d), { permanent: true, direction: 'top', className: 'drone-label' });
+    } else {
+      const icon = iconFor(d.status);
+      state.markers[d.id] = L.marker([pos.lat, pos.lon], icon ? { icon } : {}).addTo(map)
+        .bindPopup(`<strong>${d.name}</strong><br/>${d.model}<br/>Battery ${d.battery}%<br/>Speed: ${telem.speed} km/h<br/>Altitude: ${telem.altitude}m`);
+      state.markers[d.id].bindTooltip(labelFor(d), { permanent: true, direction: 'top', className: 'drone-label' });
+    }
+  });
+}
+
+function getTelemetry(droneId) {
+  return state.telemetry.find(t => t.droneId === droneId) || { droneId, lat: 0, lon: 0, battery: 0, speed: 0, altitude: 0, signal: 100 };
+}
+
+function updateTelemetry(droneId) {
+  const pos = getPosition(droneId);
+  const drone = state.drones.find(d => d.id === droneId);
+  if (!drone) return;
+
+  const existing = state.telemetry.findIndex(t => t.droneId === droneId);
+  const telemetry = {
+    droneId,
+    lat: pos.lat,
+    lon: pos.lon,
+    battery: drone.battery,
+    speed: Math.floor(Math.random() * 40 + 5),
+    altitude: Math.floor(Math.random() * 300 + 50),
+    signal: Math.floor(Math.random() * 40 + 60),
+    timestamp: new Date().toLocaleTimeString()
+  };
+
+  if (existing >= 0) {
+    state.telemetry[existing] = telemetry;
+  } else {
+    state.telemetry.push(telemetry);
+  }
+
+  // Track for polyline
+  if (!state.tracks[droneId]) state.tracks[droneId] = [];
+  state.tracks[droneId].push([pos.lat, pos.lon]);
+  if (state.tracks[droneId].length > 100) state.tracks[droneId].shift();
+
+  updatePolyline(droneId);
+}
+
+function updatePolyline(droneId) {
+  if (!map || state.tracks[droneId].length < 2) return;
+  const drone = state.drones.find(d => d.id === droneId);
+  if (!drone) return;
+
+  const color = markerColor(drone.status);
+  const points = state.tracks[droneId].map(p => [p[0], p[1]]);
+
+  if (state.polylines[droneId]) {
+    state.polylines[droneId].setLatLngs(points);
+  } else {
+    state.polylines[droneId] = L.polyline(points, { color, weight: 2, opacity: 0.7, dashArray: '5,5' }).addTo(map);
+  }
+}
+
+function fitMapToMarkers() {
+  if (!map) return;
+  const markerList = Object.values(state.markers).filter(Boolean);
+  if (markerList.length === 0) return;
+  const bounds = L.latLngBounds(markerList.map(m => m.getLatLng()));
+  map.fitBounds(bounds, { padding: [50, 50] });
+}
+function setVisibleMarkers(ids) { if (!map) return; const set = new Set(ids); Object.entries(state.markers).forEach(([id, m]) => { if (set.has(id)) { if (!map.hasLayer(m)) m.addTo(map); } else { if (map.hasLayer(m)) m.remove(); } }); }
+
+// STATUS INDICATORS
+function renderSubscription() {
+  const ind = el('#subIndicator'); if (!ind) return;
+  const s = state.subscription?.status || 'Unknown';
+  ind.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+}
+function renderStorageStatus() {
+  const ind = el('#storageIndicator'); if (!ind) return;
+  ind.textContent = storage.ok ? 'Storage OK' : 'Storage Unavailable';
+}
+function checkSubscription(url = 'http://localhost:8080/subscription') {
+  const ind = el('#subIndicator'); if (ind) ind.textContent = 'Checking...';
+  fetch(url).then(r => r.json()).then(d => {
+    state.subscription = { status: d.status || 'unknown', expiresAt: d.expiresAt || null, plan: d.plan || '' };
+    renderSubscription(); persist();
+  }).catch(() => { renderSubscription(); });
+}
+
+function testStorage() {
+  try {
+    sessionStorage.setItem('sentinel_test', 'ok');
+    const v = sessionStorage.getItem('sentinel_test');
+    storage.ok = v === 'ok';
+  } catch (e) {
+    storage.ok = false;
+  }
+  renderStorageStatus();
+}
+
+// RENDERING
+function renderDrones() {
+  const list = el("#droneList");
+  if (!list) return;
+  list.innerHTML = "";
+  state.drones.forEach(d => {
+    const pilot = state.pilots.find(p => p.id === d.pilotId);
+    const item = document.createElement("div");
+    item.className = "item";
+    item.innerHTML = `
+      <div class="row">
+        <strong>${d.name}</strong>
+        <span class="badge ${d.status}">${d.status.toUpperCase()}</span>
+      </div>
+      <div class="grid">
+        <div class="small">Model: ${d.model}</div>
+        <div class="small">Battery: ${d.battery}%</div>
+        <div class="small">Health: ${d.batteryHealth || 100}% (${d.batteryCycles || 0} cycles)</div>
+      </div>
+      <div class="row">
+        <span class="small">Pilot: ${pilot ? pilot.name : "Unassigned"}</span>
+        <div>
+          <button class="locate-drone" data-id="${d.id}">📍 Locate</button>
+          <button class="edit-drone" data-id="${d.id}">✏️ Edit</button>
+          <button class="del-drone" data-id="${d.id}">🗑️ Delete</button>
+        </div>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+  bindDroneActions();
+}
+
+function renderPilots() {
+  const list = el("#pilotList");
+  if (!list) return;
+  list.innerHTML = "";
+  state.pilots.forEach(p => {
+    const item = document.createElement("div");
+    item.className = "item";
+    item.innerHTML = `
+      <div class="row">
+        <strong>${p.name}</strong>
+        <span class="small">${p.license}</span>
+      </div>
+      <div class="row">
+        <span class="small">${p.contact}</span>
+        <span class="small">${p.homeBase}</span>
+      </div>
+      <div class="row">
+        <div></div>
+        <div>
+          <button class="edit-pilot" data-id="${p.id}">✏️ Edit</button>
+          <button class="del-pilot" data-id="${p.id}">🗑️ Delete</button>
+        </div>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+  bindPilotActions();
+}
+
+function renderMissions() {
+  const list = el("#missionList");
+  if (!list) return;
+  const pilotOnly = isPilotOnly();
+  const missionForm = el("#missionForm");
+  if (missionForm) missionForm.style.display = pilotOnly ? "none" : "grid";
+  const pilotMissionForm = el("#pilotMissionForm");
+  if (pilotMissionForm) pilotMissionForm.style.display = pilotOnly ? "grid" : "none";
+  list.innerHTML = "";
+  const missions = pilotOnly ? state.missions.filter(m => m.pilotId === state.auth.pilotId) : state.missions;
+  if (missions.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:20px;">No missions scheduled</div>';
+    return;
+  }
+  missions.forEach(m => {
+    const drone = state.drones.find(d => d.id === m.droneId);
+    const pilot = state.pilots.find(p => p.id === m.pilotId);
+    const isActive = state.activeMissionId === m.id;
+    const item = document.createElement("div");
+    item.className = "item" + (isActive ? " active-mission" : "");
+    item.innerHTML = `
+      <div class="row"><strong>${m.title}</strong> ${isActive ? '<span style="color:#2ecc71;">🔴 LIVE</span>' : ''}</div>
+      <div class="small">Drone: ${drone ? drone.name : "N/A"} • Pilot: ${pilot ? pilot.name : "N/A"}</div>
+      <div class="small">Status: ${m.status}</div>
+      <div style="margin-top:8px;">
+        <button class="launch-mission" data-id="${m.id}">${isActive ? '⏹️ End' : '▶️ Launch'}</button>
+        <button class="del-mission" data-id="${m.id}">🗑️ Delete</button>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+  bindMissionActions();
+}
+
+function renderMaintenance() {
+  const list = el("#maintenanceList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (state.maintenance.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:20px;">No maintenance tasks</div>';
+    return;
+  }
+  state.maintenance.forEach(m => {
+    const item = document.createElement("div");
+    item.className = "item";
+    item.innerHTML = `
+      <div class="row"><strong>${m.title}</strong><span class="badge ${m.status}">${m.status.toUpperCase()}</span></div>
+      <div class="small">Type: ${m.type.toUpperCase()}</div>
+      <div style="margin-top:8px;">
+        <button class="del-maint" data-id="${m.id}">🗑️ Delete</button>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+  els('.del-maint').forEach(btn => {
+    btn.onclick = (e) => { e.preventDefault(); const id = btn.dataset.id; if (confirm('Delete this maintenance task?')) { state.maintenance = state.maintenance.filter(x => x.id !== id); apiDelete(`/maintenance/${id}`); persist(); renderMaintenance(); } };
+  });
+}
+
+function renderDocuments() {
+  const list = el("#documentList");
+  if (!list) return;
+  const pilotOnly = isPilotOnly();
+  const docForm = el("#documentForm");
+  if (docForm) docForm.style.display = pilotOnly ? "none" : "grid";
+  const pilotDocForm = el("#pilotDocumentForm");
+  if (pilotDocForm) pilotDocForm.style.display = pilotOnly ? "grid" : "none";
+  list.innerHTML = "";
+  const docs = pilotOnly ? state.documents.filter(d => d.pilotId === state.auth.pilotId) : state.documents;
+  if (docs.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:20px;">No documents</div>';
+    return;
+  }
+  docs.forEach(d => {
+    const pilot = state.pilots.find(p => p.id === d.pilotId);
+    const item = document.createElement("div");
+    item.className = "item";
+    item.innerHTML = `
+      <div class="row"><strong>${d.type}</strong><span class="badge ${d.status}">${d.status.toUpperCase()}</span></div>
+      <div class="small">Ref: ${d.number} • Pilot: ${pilot ? pilot.name : "N/A"}</div>
+    `;
+    list.appendChild(item);
+  });
+}
+
+function renderIncidents() {
+  const list = el("#incidentList");
+  if (!list) return;
+  const pilotOnly = isPilotOnly();
+  const incidentForm = el("#incidentForm");
+  if (incidentForm) incidentForm.style.display = "grid";
+  list.innerHTML = "";
+  const incidents = pilotOnly ? state.incidents.filter(i => i.pilotId === state.auth.pilotId) : state.incidents;
+  if (incidents.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:20px;">No incidents recorded</div>';
+    return;
+  }
+  incidents.forEach(i => {
+    const drone = state.drones.find(d => d.id === i.droneId);
+    const pilot = state.pilots.find(p => p.id === i.pilotId);
+    const item = document.createElement("div");
+    item.className = "item incident-card";
+    item.innerHTML = `
+      <div class="row"><strong>${i.title}</strong><span class="badge ${i.severity}">${i.severity.toUpperCase()}</span></div>
+      <div class="small">Drone: ${drone ? drone.name : "N/A"} • Pilot: ${pilot ? pilot.name : "N/A"}</div>
+      <div class="small">Date: ${i.date} • Location: ${i.location}</div>
+      <p class="small" style="margin-top:4px;">${i.description}</p>
+      <div style="margin-top:8px;">
+        <button class="del-incident" data-id="${i.id}">🗑️ Delete</button>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+  els('.del-incident').forEach(btn => {
+    btn.onclick = (e) => { e.preventDefault(); const id = btn.dataset.id; if (confirm('Delete this incident report?')) { state.incidents = state.incidents.filter(x => x.id !== id); apiDelete(`/incidents/${id}`); persist(); renderIncidents(); } };
+  });
+}
+
+function renderAnalytics() {
+  const c = el("#analyticsContainer");
+  if (!c) return;
+  const activeCount = state.drones.filter(d => d.status === "active").length;
+  c.innerHTML = `
+    <div class="analytics-grid">
+      <div class="stat-card">
+        <div class="stat-label">Active Drones</div>
+        <div class="stat-value">${activeCount}/${state.drones.length}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Missions</div>
+        <div class="stat-value">${state.missions.length}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Fleet Efficiency</div>
+        <div class="stat-value">${state.analytics.operationalEfficiency}%</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Maintenance Tasks</div>
+        <div class="stat-value">${state.maintenance.length}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderAlerts() {
+  const c = el("#alertsList");
+  if (!c) return;
+  c.innerHTML = "";
+  const alerts = [];
+  state.drones.forEach(d => {
+    if (d.battery < 20) alerts.push({ msg: `⚠️ ${d.name}: Low battery (${d.battery}%)`, type: "critical" });
+    else if (d.battery < 50) alerts.push({ msg: `⚡ ${d.name}: Battery at ${d.battery}%`, type: "warning" });
+
+    if (d.batteryHealth < 80) alerts.push({ msg: `💔 ${d.name}: Low battery health (${d.batteryHealth}%)`, type: "critical" });
+    else if (d.batteryHealth < 90) alerts.push({ msg: `🔋 ${d.name}: Degraded battery health (${d.batteryHealth}%)`, type: "warning" });
+    if (d.batteryCycles > 200) alerts.push({ msg: `⚙️ ${d.name}: High cycle count (${d.batteryCycles})`, type: "warning" });
+  });
+  if (alerts.length === 0) {
+    c.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:20px;">✓ All systems normal</div>';
+    return;
+  }
+  alerts.forEach(a => {
+    const div = document.createElement("div");
+    div.className = `alert-item alert-${a.type}`;
+    div.textContent = a.msg;
+    c.appendChild(div);
+  });
+}
+
+function renderPilotAccessList() {
+  const list = el('#pilotAccessList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.pilots.length) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:12px;">No pilots available</div>';
+    return;
+  }
+  state.pilots.forEach(p => {
+    const acct = state.pilotAccounts.find(a => a.pilotId === p.id);
+    const status = acct?.active ? 'active' : 'inactive';
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `
+      <div class="row">
+        <strong>${p.name}</strong>
+        <span class="badge ${status}">${status.toUpperCase()}</span>
+      </div>
+      <div class="small">License: ${p.license} • Username: ${acct?.username || '—'}</div>
+    `;
+    list.appendChild(item);
+  });
+}
+
+function renderPilotApplications() {
+  const list = el('#pilotApplyList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.pilotApplications.length) {
+    list.innerHTML = '<div style="text-align:center;color:#b9c4d4;padding:12px;">No pending applications</div>';
+    return;
+  }
+  state.pilotApplications.forEach(app => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `
+      <div class="row">
+        <strong>${app.name}</strong>
+        <span class="badge ${app.status || 'pending'}">${(app.status || 'pending').toUpperCase()}</span>
+      </div>
+      <div class="small">License: ${app.license} • Username: ${app.username}</div>
+      <div class="small">Contact: ${app.contact} • Base: ${app.homeBase}</div>
+      <div style="margin-top:8px;">
+        <button class="approve-app" data-id="${app.id}">✅ Approve</button>
+        <button class="reject-app" data-id="${app.id}">🗑️ Reject</button>
+      </div>
+    `;
+    list.appendChild(item);
+  });
+
+  els('.approve-app').forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      if (!state.adminAuth.isAdmin) return;
+      const app = state.pilotApplications.find(a => a.id === btn.dataset.id);
+      if (!app) return;
+      const pilotId = id();
+      const pilot = {
+        id: pilotId,
+        name: app.name,
+        license: app.license,
+        licenseExpiry: app.licenseExpiry || "",
+        contact: app.contact,
+        homeBase: app.homeBase,
+        flightHours: 0,
+        status: "active"
+      };
+      state.pilots.push(pilot);
+      apiPost('/pilots', pilot);
+      state.pilotAccounts.push({ pilotId, username: app.username, password: app.password, active: true });
+      app.status = 'approved';
+      app.approvedAt = new Date().toISOString();
+      persist();
+      renderPilots();
+      refreshSelects();
+      renderPilotAccessList();
+      renderPilotApplications();
+    };
+  });
+  els('.reject-app').forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      if (!state.adminAuth.isAdmin) return;
+      const app = state.pilotApplications.find(a => a.id === btn.dataset.id);
+      if (!app) return;
+      app.status = 'rejected';
+      app.rejectedAt = new Date().toISOString();
+      persist();
+      renderPilotApplications();
+    };
+  });
+}
+
+// BUTTON HANDLERS
+function bindDroneActions() {
+  els(".edit-drone").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const d = state.drones.find(x => x.id === btn.dataset.id);
+      if (!d) return;
+      const f = el("#droneForm");
+      f.name.value = d.name;
+      f.model.value = d.model;
+      f.status.value = d.status;
+      f.battery.value = d.battery;
+      f.batteryCycles.value = d.batteryCycles || 0;
+      f.batteryHealth.value = d.batteryHealth || 100;
+      f.pilotId.value = d.pilotId || "";
+      f.serialNumber.value = d.serialNumber || "";
+      f.dataset.edit = d.id;
+    };
+  });
+  els(".del-drone").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      if (confirm("Delete this drone?")) {
+        state.drones = state.drones.filter(d => d.id !== btn.dataset.id);
+        apiDelete(`/drones/${btn.dataset.id}`);
+        persist();
+        renderDrones();
+        syncMarkers();
+      }
+    };
+  });
+  els(".locate-drone").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const pos = getPosition(btn.dataset.id);
+      if (map && pos) map.setView([pos.lat, pos.lon], 12);
+    };
+  });
+}
+
+function bindPilotActions() {
+  els(".edit-pilot").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const p = state.pilots.find(x => x.id === btn.dataset.id);
+      if (!p) return;
+      const f = el("#pilotForm");
+      const acct = state.pilotAccounts.find(a => a.pilotId === p.id);
+      f.name.value = p.name;
+      f.license.value = p.license;
+      f.licenseExpiry.value = p.licenseExpiry;
+      f.contact.value = p.contact;
+      f.homeBase.value = p.homeBase;
+      f.flightHours.value = p.flightHours || 0;
+      f.status.value = p.status;
+      if (f.loginUsername) f.loginUsername.value = acct?.username || '';
+      if (f.loginPassword) f.loginPassword.value = '';
+      if (f.loginActive) f.loginActive.checked = acct ? !!acct.active : true;
+      f.dataset.edit = p.id;
+    };
+  });
+  els(".del-pilot").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      if (confirm("Delete this pilot?")) {
+        const pid = btn.dataset.id;
+        state.pilots = state.pilots.filter(p => p.id !== pid);
+        state.pilotAccounts = state.pilotAccounts.filter(a => a.pilotId !== pid);
+        state.drones.forEach(d => { if (d.pilotId === pid) d.pilotId = null; });
+        apiDelete(`/pilots/${pid}`);
+        persist();
+        renderPilots();
+        renderDrones();
+        refreshSelects();
+        renderPilotAccessList();
+      }
+    };
+  });
+}
+
+function bindMissionActions() {
+  els(".del-mission").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      if (confirm("Delete this mission?")) {
+        state.missions = state.missions.filter(m => m.id !== btn.dataset.id);
+        apiDelete(`/missions/${btn.dataset.id}`);
+        persist();
+        renderMissions();
+      }
+    };
+  });
+  els(".launch-mission").forEach(btn => {
+    btn.onclick = (e) => {
+      e.preventDefault();
+      const missionId = btn.dataset.id;
+      if (state.activeMissionId === missionId) {
+        state.activeMissionId = null;
+        clearMissionRoute();
+      } else {
+        state.activeMissionId = missionId;
+        const m = state.missions.find(x => x.id === missionId);
+        if (m) launchMission(m);
+      }
+      renderMissions();
+    };
+  });
+}
+
+// FORM HANDLERS
+function handleForms() {
+  const droneForm = el("#droneForm");
+  if (droneForm) {
+    droneForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const d = {
+        name: f.name.value.trim(),
+        model: f.model.value.trim(),
+        status: f.status.value,
+        battery: Number(f.battery.value || 0),
+        batteryCycles: Number(f.batteryCycles?.value || 0),
+        batteryHealth: Number(f.batteryHealth?.value || 100),
+        pilotId: f.pilotId.value || null,
+        serialNumber: f.serialNumber.value.trim() || ""
+      };
+      if (f.dataset.edit) {
+        const id_val = f.dataset.edit;
+        state.drones = state.drones.map(x => x.id === id_val ? { ...x, ...d, id: id_val } : x);
+        apiPut(`/drones/${id_val}`, state.drones.find(x => x.id === id_val));
+      } else {
+        const newId = id();
+        state.drones.push({ ...d, id: newId });
+        getPosition(newId);
+        apiPost('/drones', state.drones.find(x => x.id === newId));
+      }
+      f.reset();
+      f.dataset.edit = "";
+      persist();
+      renderDrones();
+      syncMarkers();
+      refreshSelects();
+    };
+  }
+
+  const loginForm = el("#loginForm");
+  if (loginForm) {
+    loginForm.onsubmit = (e) => {
+      e.preventDefault();
+      try {
+        setLoginMessage('');
+        const f = e.target;
+        const loginId = f.license.value.trim();
+        const password = f.password.value;
+        let pilot = state.pilots.find(p => p.license.toLowerCase() === loginId.toLowerCase());
+        let acct = pilot ? state.pilotAccounts.find(a => a.pilotId === pilot.id) : null;
+        const acctByUsername = state.pilotAccounts.find(a => (a.username || '').toLowerCase() === loginId.toLowerCase());
+        if (acctByUsername) {
+          acct = acctByUsername;
+          const byId = state.pilots.find(p => p.id === acctByUsername.pilotId);
+          if (byId) pilot = byId;
+        }
+
+      const completePilotLogin = (pilotId, token) => {
+        // Pilot session should not retain admin privileges
+        if (state.adminAuth.isAdmin) {
+          state.adminAuth.isAdmin = false;
+          state.adminAuth.username = '';
+          sessionStorage.removeItem('sentinel_isAdmin');
+          sessionStorage.removeItem('sentinel_adminUser');
+          setAdminPortalAccess(false);
+        }
+        state.auth.token = token;
+        state.auth.pilotId = pilotId;
+        state.auth.isPilot = true;
+        sessionStorage.setItem('sentinel_token', token);
+        sessionStorage.setItem('sentinel_pilotId', pilotId);
+        sessionStorage.setItem('sentinel_isPilot', 'true');
+        setPilotPortalAccess(true);
+        const welcome = el('#pilotWelcome'); const fpForm = el('#flightPlanForm'); const docForm = el('#pilotDocForm'); const logout = el('#logoutBtn');
+        if (welcome) { welcome.style.display = 'block'; welcome.textContent = `Logged in as Pilot #${pilotId}` }
+        if (fpForm) { fpForm.style.display = 'grid' }
+        if (docForm) { docForm.style.display = 'grid' }
+        const followWrap = el('#pilotFollowWrap'); const followToggle = el('#followMissionToggle');
+        if (followWrap) {
+          followWrap.style.display = 'block';
+          if (followToggle) {
+            followToggle.checked = !!state.followMission;
+            followToggle.onchange = () => { state.followMission = followToggle.checked; };
+          }
+        }
+        if (logout) {
+          logout.style.display = 'inline-block';
+          logout.onclick = () => {
+            state.auth.token = ''; state.auth.pilotId = ''; state.auth.isPilot = false;
+            sessionStorage.removeItem('sentinel_token'); sessionStorage.removeItem('sentinel_pilotId'); sessionStorage.removeItem('sentinel_isPilot');
+            setPilotPortalAccess(false);
+            if (welcome) { welcome.style.display = 'none' }
+            if (fpForm) { fpForm.style.display = 'none' }
+            if (docForm) { docForm.style.display = 'none' }
+            if (el('#flightPlanList')) el('#flightPlanList').style.display = 'none';
+            if (el('#pilotDocumentList')) el('#pilotDocumentList').style.display = 'none';
+            if (el('#pilotFollowWrap')) el('#pilotFollowWrap').style.display = 'none';
+            logout.style.display = 'none';
+          };
+        }
+        fetchFlightPlans().then(renderFlightPlans);
+        fetchPilotDocuments().then(renderPilotDocuments);
+        renderPilotMissions();
+      };
+
+        if (!pilot) {
+          setLoginMessage('Pilot not found. Check license or username.', true);
+          return;
+        }
+        if (!acct || !acct.active) {
+          setLoginMessage('Pilot login is not enabled. Contact admin.', true);
+          return;
+        }
+        if (acct.password === password) {
+          completePilotLogin(pilot.id, `local-${id()}`);
+          setLoginMessage('Login successful.');
+          return;
+        }
+
+        const body = { license: loginId, password };
+        fetch(`${API_BASE}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json()).then(d => {
+          if (d && d.token) {
+            completePilotLogin(d.pilotId, d.token);
+            setLoginMessage('Login successful.');
+          } else {
+            setLoginMessage('Invalid credentials.', true);
+          }
+        }).catch(() => {
+          setLoginMessage('Login failed. Check server connection.', true);
+        });
+      } catch (err) {
+        console.error('Pilot login error:', err);
+        setLoginMessage('Login error. Check console for details.', true);
+      }
+    };
+  }
+
+  const pilotApplyForm = el("#pilotApplyForm");
+  if (pilotApplyForm) {
+    pilotApplyForm.onsubmit = (e) => {
+      e.preventDefault();
+      setApplyMessage('');
+      const f = e.target;
+      const app = {
+        id: id(),
+        name: f.name.value.trim(),
+        license: f.license.value.trim(),
+        licenseExpiry: f.licenseExpiry.value || "",
+        contact: f.contact.value.trim(),
+        homeBase: f.homeBase.value.trim(),
+        username: f.username.value.trim(),
+        password: f.password.value,
+        status: 'pending',
+        submittedAt: new Date().toISOString()
+      };
+      if (!app.name || !app.license || !app.username || !app.password) {
+        setApplyMessage('Fill in all required fields.', true);
+        return;
+      }
+      const licenseExists = state.pilots.some(p => p.license.toLowerCase() === app.license.toLowerCase());
+      const usernameExists = state.pilotAccounts.some(a => (a.username || '').toLowerCase() === app.username.toLowerCase());
+      const pendingUsername = state.pilotApplications.some(a => (a.username || '').toLowerCase() === app.username.toLowerCase() && a.status === 'pending');
+      if (licenseExists) { setApplyMessage('License already registered.', true); return; }
+      if (usernameExists || pendingUsername) { setApplyMessage('Username already in use.', true); return; }
+      state.pilotApplications.push(app);
+      persist();
+      renderPilotApplications();
+      f.reset();
+      setApplyMessage('Application submitted for admin approval.');
+    };
+  }
+
+  const adminLoginForm = el("#adminLoginForm");
+  if (adminLoginForm) {
+    adminLoginForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const username = f.username.value.trim();
+      const password = f.password.value;
+      const admin = state.adminUsers.find(a => a.username.toLowerCase() === username.toLowerCase() && a.password === password);
+      if (admin) {
+        state.adminAuth.isAdmin = true;
+        state.adminAuth.username = admin.username;
+        sessionStorage.setItem('sentinel_isAdmin', 'true');
+        sessionStorage.setItem('sentinel_adminUser', admin.username);
+        setAdminPortalAccess(true);
+        setPilotPortalAccess(state.auth.isPilot);
+        f.reset();
+      }
+    };
+  }
+
+  const adminLogoutBtn = el("#adminLogoutBtn");
+  if (adminLogoutBtn) {
+    adminLogoutBtn.onclick = () => {
+      state.adminAuth.isAdmin = false;
+      state.adminAuth.username = '';
+      sessionStorage.removeItem('sentinel_isAdmin');
+      sessionStorage.removeItem('sentinel_adminUser');
+      setAdminPortalAccess(false);
+      setPilotPortalAccess(state.auth.isPilot);
+    };
+  }
+
+  const pilotAccessForm = el("#pilotAccessForm");
+  if (pilotAccessForm) {
+    pilotAccessForm.onsubmit = (e) => {
+      e.preventDefault();
+      if (!state.adminAuth.isAdmin) return;
+      const f = e.target;
+      const pilotId = f.pilotId.value;
+      const username = f.username?.value.trim() || '';
+      const password = f.password.value;
+      const active = !!f.active.checked;
+      if (!pilotId || !password) return;
+      if (username) {
+        const conflict = state.pilotAccounts.find(a => (a.username || '').toLowerCase() === username.toLowerCase() && a.pilotId !== pilotId);
+        if (conflict) { alert('Username already in use'); return; }
+      }
+      const idx = state.pilotAccounts.findIndex(a => a.pilotId === pilotId);
+      if (idx >= 0) {
+        state.pilotAccounts[idx] = { ...state.pilotAccounts[idx], username: username || state.pilotAccounts[idx].username || '', password, active };
+      } else {
+        state.pilotAccounts.push({ pilotId, username, password, active });
+      }
+      f.reset();
+      f.active.checked = true;
+      persist();
+      renderPilotAccessList();
+    };
+  }
+
+  const fpForm = el("#flightPlanForm");
+  if (fpForm) {
+    fpForm.onsubmit = (e) => {
+      e.preventDefault();
+      if (!state.auth.token) return;
+      const f = e.target;
+      const data = { title: f.title.value.trim(), location: f.location.value.trim(), startTime: f.startTime.value, endTime: f.endTime.value, notes: f.notes.value.trim(), status: 'filed' };
+      apiPostAuth('/flightplans', data).then(() => { f.reset(); fetchFlightPlans().then(renderFlightPlans) });
+    };
+  }
+
+  const pilotMissionForm = el("#pilotMissionForm");
+  if (pilotMissionForm) {
+    pilotMissionForm.onsubmit = (e) => {
+      e.preventDefault();
+      if (!state.auth.token || !state.auth.pilotId) return;
+      const f = e.target;
+      const data = {
+        title: f.title.value.trim(),
+        location: f.location.value.trim(),
+        startTime: f.startTime.value,
+        endTime: f.endTime.value,
+        notes: f.notes.value.trim(),
+        status: 'filed'
+      };
+      apiPostAuth('/flightplans', data).then(() => { f.reset(); fetchFlightPlans().then(renderFlightPlans) });
+    };
+  }
+
+  const pilotDocForm = el("#pilotDocForm");
+  if (pilotDocForm) {
+    pilotDocForm.onsubmit = (e) => {
+      e.preventDefault();
+      if (!state.auth.token || !state.auth.pilotId) return;
+      const f = e.target;
+      const type = f.type.value.trim();
+      if (type !== "License" && type !== "Medical") return;
+      const newD = {
+        id: id(),
+        pilotId: state.auth.pilotId,
+        type,
+        number: f.number.value.trim(),
+        issueDate: f.issueDate.value,
+        expiryDate: f.expiryDate.value || "",
+        status: "pending"
+      };
+      state.documents.push(newD);
+      apiPostAuth('/documents', newD);
+      f.reset();
+      persist();
+      renderPilotDocuments();
+    };
+  }
+
+  const pilotDocumentForm = el("#pilotDocumentForm");
+  if (pilotDocumentForm) {
+    pilotDocumentForm.onsubmit = (e) => {
+      e.preventDefault();
+      if (!state.auth.token || !state.auth.pilotId) return;
+      const f = e.target;
+      const type = f.type.value.trim();
+      if (type !== "License" && type !== "Medical") return;
+      const newD = {
+        id: id(),
+        pilotId: state.auth.pilotId,
+        type,
+        number: f.number.value.trim(),
+        issueDate: f.issueDate.value,
+        expiryDate: f.expiryDate.value || "",
+        status: "pending"
+      };
+      state.documents.push(newD);
+      apiPostAuth('/documents', newD);
+      f.reset();
+      persist();
+      renderDocuments();
+    };
+  }
+
+  const pilotForm = el("#pilotForm");
+  if (pilotForm) {
+    pilotForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const d = {
+        name: f.name.value.trim(),
+        license: f.license.value.trim(),
+        licenseExpiry: f.licenseExpiry.value || "",
+        contact: f.contact.value.trim(),
+        homeBase: f.homeBase.value.trim(),
+        flightHours: parseInt(f.flightHours.value || 0),
+        status: f.status.value || "active"
+      };
+      const loginUsername = f.loginUsername?.value.trim() || "";
+      const loginPassword = f.loginPassword?.value || "";
+      const loginActive = f.loginActive ? !!f.loginActive.checked : true;
+      if ((loginUsername || loginPassword) && (!loginUsername || !loginPassword)) {
+        alert("Provide both pilot username and password or leave both blank.");
+        return;
+      }
+      if (loginUsername) {
+        const conflict = state.pilotAccounts.find(a => (a.username || '').toLowerCase() === loginUsername.toLowerCase() && a.pilotId !== f.dataset.edit);
+        if (conflict) { alert("Username already in use"); return; }
+      }
+      if (f.dataset.edit) {
+        const id_val = f.dataset.edit;
+        state.pilots = state.pilots.map(p => p.id === id_val ? { ...p, ...d, id: id_val } : p);
+        apiPut(`/pilots/${id_val}`, state.pilots.find(x => x.id === id_val));
+        if (loginUsername && loginPassword) {
+          const idx = state.pilotAccounts.findIndex(a => a.pilotId === id_val);
+          if (idx >= 0) {
+            state.pilotAccounts[idx] = { ...state.pilotAccounts[idx], username: loginUsername, password: loginPassword, active: loginActive };
+          } else {
+            state.pilotAccounts.push({ pilotId: id_val, username: loginUsername, password: loginPassword, active: loginActive });
+          }
+        }
+      } else {
+        const newId = id(); state.pilots.push({ ...d, id: newId }); apiPost('/pilots', state.pilots.find(x => x.id === newId));
+        if (loginUsername && loginPassword) {
+          state.pilotAccounts.push({ pilotId: newId, username: loginUsername, password: loginPassword, active: loginActive });
+        }
+      }
+      f.reset();
+      f.dataset.edit = "";
+      persist();
+      renderPilots();
+      refreshSelects();
+      renderPilotAccessList();
+    };
+  }
+
+  const missionForm = el("#missionForm");
+  if (missionForm) {
+    missionForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const newMission = {
+        id: id(),
+        title: f.title.value.trim(),
+        droneId: f.droneId.value,
+        pilotId: f.pilotId.value,
+        startTime: f.startTime.value,
+        endTime: f.endTime.value,
+        status: "pending"
+      }; state.missions.push(newMission); apiPost('/missions', newMission);
+      f.reset();
+      persist();
+      renderMissions();
+      renderAnalytics();
+      state.activeMissionId = newMission.id;
+      launchMission(newMission);
+      const did = newMission.droneId;
+      const pos = getPosition(did);
+      if (map && pos) map.setView([pos.lat, pos.lon], 12);
+      if (state.markers[did]) state.markers[did].openPopup();
+    };
+  }
+
+  const maintForm = el("#maintenanceForm");
+  if (maintForm) {
+    maintForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const d = {
+        droneId: f.droneId.value,
+        title: f.title.value.trim(),
+        type: f.type.value,
+        dueDate: f.dueDate.value,
+        status: f.status.value,
+        notes: f.notes.value.trim() || ""
+      };
+      const newM = { ...d, id: id() }; state.maintenance.push(newM); apiPost('/maintenance', newM);
+      f.reset();
+      persist();
+      renderMaintenance();
+    };
+  }
+
+  const docForm = el("#documentForm");
+  if (docForm) {
+    docForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const newD = {
+        id: id(),
+        pilotId: f.pilotId.value || "",
+        type: f.type.value.trim(),
+        number: f.number.value.trim(),
+        issueDate: f.issueDate.value,
+        expiryDate: f.expiryDate.value || "",
+        status: f.status.value || "valid"
+      }; state.documents.push(newD); apiPost('/documents', newD);
+      f.reset();
+      persist();
+      renderDocuments();
+    };
+  }
+
+  const incidentForm = el("#incidentForm");
+  if (incidentForm) {
+    incidentForm.onsubmit = (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const newI = {
+        id: id(),
+        title: f.title.value.trim(),
+        date: f.date.value,
+        location: f.location.value.trim(),
+        severity: f.severity.value,
+        droneId: f.droneId.value,
+        pilotId: f.pilotId.value,
+        description: f.description.value.trim()
+      };
+      state.incidents.push(newI);
+      apiPost('/incidents', newI);
+      f.reset();
+      persist();
+      renderIncidents();
+    };
+  }
+  const connectBtn = el('#connectWs');
+  if (connectBtn) connectBtn.onclick = () => {
+    stopHttpPoll();
+    const url = (el('#wsUrl')?.value || '').trim();
+    if (url) connectWs(url);
+  };
+  const disconnectBtn = el('#disconnectWs');
+  if (disconnectBtn) disconnectBtn.onclick = () => { disconnectWs(); stopHttpPoll(); };
+  const pollBtn = el('#pollHttpBtn');
+  if (pollBtn) pollBtn.onclick = () => { disconnectWs(); startHttpPoll(); };
+  const stopPollBtn = el('#stopPollBtn');
+  if (stopPollBtn) stopPollBtn.onclick = () => stopHttpPoll();
+
+  function exportPDF() {
+    const rows = (arr, cols) => arr.map(x => `<tr>${cols.map(c => `<td>${c(x) ?? ''}</td>`).join('')}</tr>`).join('');
+    const drones = rows(state.drones, [x => x.name, x => x.model, x => x.status, x => x.battery + "%", x => { const p = state.pilots.find(p => p.id === x.pilotId); return p ? p.name : "Unassigned" }]);
+    const pilots = rows(state.pilots, [x => x.name, x => x.license, x => x.homeBase, x => x.status]);
+    const missions = rows(state.missions, [x => x.title, x => { const d = state.drones.find(d => d.id === x.droneId); return d ? d.name : "" }, x => { const p = state.pilots.find(p => p.id === x.pilotId); return p ? p.name : "" }, x => x.status]);
+    const maint = rows(state.maintenance, [x => x.title, x => x.type, x => x.status, x => x.dueDate]);
+    const docs = rows(state.documents, [x => x.type, x => x.number, x => x.status]);
+    const incidents = rows(state.incidents || [], [x => x.title, x => x.severity, x => x.date, x => x.description]);
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Sentinel Report</title><style>body{font-family:Arial,Helvetica,sans-serif;color:#111;padding:20px}h1{margin:0 0 10px}h2{margin:16px 0 8px}table{width:100%;border-collapse:collapse;margin:8px 0}th,td{border:1px solid #999;padding:6px 8px;font-size:12px}th{background:#eee;text-align:left}small{color:#666}button{padding:8px 12px;border:1px solid #333;border-radius:6px;background:#f5f5f5;cursor:pointer}</style></head><body><h1>Sentinel Fleet Report</h1><small>Generated ${new Date().toLocaleString()}</small><div style="margin:8px 0"><button onclick="window.print()">Print / Save as PDF</button></div><h2>Drones</h2><table><thead><tr><th>Name</th><th>Model</th><th>Status</th><th>Battery</th><th>Pilot</th></tr></thead><tbody>${drones}</tbody></table><h2>Pilots</h2><table><thead><tr><th>Name</th><th>License</th><th>Home Base</th><th>Status</th></tr></thead><tbody>${pilots}</tbody></table><h2>Missions</h2><table><thead><tr><th>Title</th><th>Drone</th><th>Pilot</th><th>Status</th></tr></thead><tbody>${missions}</tbody></table><h2>Maintenance</h2><table><thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Due</th></tr></thead><tbody>${maint}</tbody></table><h2>Incidents</h2><table><thead><tr><th>Incident</th><th>Severity</th><th>Date</th><th>Summary</th></tr></thead><tbody>${incidents}</tbody></table><h2>Documents</h2><table><thead><tr><th>Type</th><th>Number</th><th>Status</th></tr></thead><tbody>${docs}</tbody></table></body></html>`;
+    const w = window.open('', '_blank'); if (!w) return; w.document.write(html); w.document.close(); w.focus();
+  }
+
+  const exportBtn = el('#exportBtn'); if (exportBtn) exportBtn.onclick = () => exportPDF();
+  const syncBtn = el('#syncBtn'); if (syncBtn) syncBtn.onclick = () => syncToCloud();
+
+  const importBtn = el('#importBtn');
+  if (importBtn) importBtn.onclick = () => el('#importFile')?.click();
+  const importFile = el('#importFile');
+  if (importFile) importFile.onchange = (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const data = JSON.parse(r.result);
+        Object.assign(state, data);
+        persist();
+        renderPilots(); renderDrones(); renderMissions(); renderMaintenance(); renderDocuments();
+        refreshSelects(); syncMarkers(); fitMapToMarkers(); renderTelemetryFeed();
+        renderSubscription(); renderStorageStatus();
+      } catch (err) { }
+    };
+    r.readAsText(f);
+  };
+
+  const checkBtn = el('#checkSubBtn');
+  if (checkBtn) checkBtn.onclick = () => { const ind = el('#subIndicator'); if (ind) ind.textContent = 'Checking...'; checkSubscription(); };
+  const subBadge = el('#subIndicator'); if (subBadge) subBadge.onclick = () => { subBadge.textContent = 'Checking...'; checkSubscription(); };
+  const storBadge = el('#storageIndicator'); if (storBadge) storBadge.onclick = () => { testStorage(); };
+
+  const telImp = el('#telemetryImport');
+  if (telImp) telImp.onchange = (e) => { if (e.target.files[0]) handleTelemetryImport(e.target.files[0]); };
+}
+
+// UTILITIES
+function refreshSelects() {
+  const pilotSelects = els("[name='pilotId']");
+  pilotSelects.forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— Unassigned —</option>';
+    state.pilots.forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name;
+      sel.appendChild(opt);
+    });
+    sel.value = current;
+  });
+
+  const droneSelects = els("[name='droneId']");
+  droneSelects.forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— Select Drone —</option>';
+    state.drones.forEach(d => {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = `${d.name} (${d.battery}%)`;
+      sel.appendChild(opt);
+    });
+    sel.value = current;
+  });
+
+  const dynamicPilotSelects = els(".pilot-select-dynamic");
+  dynamicPilotSelects.forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— Select Pilot —</option>';
+    state.pilots.forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name;
+      sel.appendChild(opt);
+    });
+    sel.value = current;
+  });
+
+  const dynamicDroneSelects = els(".drone-select-dynamic");
+  dynamicDroneSelects.forEach(sel => {
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— Select Drone —</option>';
+    state.drones.forEach(d => {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = d.name;
+      sel.appendChild(opt);
+    });
+    sel.value = current;
+  });
+}
+
+function bindTabs() {
+  els(".tab").forEach(tab => {
+    tab.onclick = () => {
+      els(".tab").forEach(t => t.classList.remove("active"));
+      els(".tabcontent").forEach(tc => tc.classList.remove("active"));
+      tab.classList.add("active");
+      const content = el(`#${tab.dataset.tab}`);
+      if (content) content.classList.add("active");
+    };
+  });
+}
+
+function launchMission(mission) {
+  if (!hasLeaflet() || !map) return;
+  const drone = state.drones.find(d => d.id === mission.droneId);
+  if (!drone) return;
+
+  // Generate random waypoints for this mission
+  const waypointCount = 5;
+  const basePos = getPosition(drone.id);
+  const waypoints = [{ lat: basePos.lat, lon: basePos.lon }];
+
+  for (let i = 0; i < waypointCount; i++) {
+    const offset = (i + 1) * 0.02;
+    waypoints.push({
+      lat: basePos.lat + (Math.random() - 0.5) * offset,
+      lon: basePos.lon + (Math.random() - 0.5) * offset
+    });
+  }
+  waypoints.push({ lat: basePos.lat, lon: basePos.lon });
+
+  // Draw route on map
+  const color = markerColor(drone.status);
+  const routePoints = waypoints.map(w => [w.lat, w.lon]);
+  const routeLine = L.polyline(routePoints, { color: '#4cc9f0', weight: 3, opacity: 0.9 }).addTo(map);
+
+  // Add waypoint markers
+  waypoints.forEach((wp, idx) => {
+    const marker = L.circleMarker([wp.lat, wp.lon], {
+      radius: 5,
+      color: '#4cc9f0',
+      fill: true,
+      fillColor: '#4cc9f0',
+      fillOpacity: 0.7
+    }).addTo(map).bindPopup(`Waypoint ${idx}`);
+  });
+
+  // Store for clearing later
+  if (!state.polylines[mission.droneId]) state.polylines[mission.droneId] = [];
+  state.polylines[mission.droneId] = { routeLine, waypoints };
+}
+
+function clearMissionRoute() {
+  if (!hasLeaflet() || !map) return;
+  const mission = state.missions.find(m => m.id === state.activeMissionId);
+  if (!mission) return;
+  const drone = state.drones.find(d => d.id === mission.droneId);
+  if (!drone) return;
+
+  if (state.polylines[drone.id] && state.polylines[drone.id].routeLine) {
+    map.removeLayer(state.polylines[drone.id].routeLine);
+  }
+}
+
+function renderTelemetryFeed() {
+  const feed = el("#telemetryFeed");
+  if (!feed) return;
+
+  feed.innerHTML = '<div style="font-size:12px;"><strong>Live Telemetry Feed</strong></div>';
+  if (!state.telemetry.length) {
+    feed.innerHTML += '<div style="padding:8px;margin:6px 0;background:#111;font-size:11px;color:#b9c4d4;">No telemetry yet. Add a drone or start Poll HTTP.</div>';
+    return;
+  }
+  state.telemetry.forEach(t => {
+    const drone = state.drones.find(d => d.id === t.droneId);
+    if (!drone) return;
+    const item = document.createElement("div");
+    item.style.cssText = "padding:8px;margin:4px 0;border-left:3px solid " + markerColor(drone.status) + ";background:#111;font-size:11px;";
+    item.innerHTML = `
+      <div><strong>${drone.name}</strong> <span style="color:#2ecc71;">${t.timestamp}</span></div>
+      <div>Lat: ${t.lat.toFixed(4)} | Lon: ${t.lon.toFixed(4)}</div>
+      <div>Alt: ${t.altitude}m | Speed: ${t.speed} km/h | Battery: ${t.battery}%</div>
+      <div>Signal: ${t.signal}%</div>
+    `;
+    feed.appendChild(item);
+  });
+}
+
+// FILTER/SEARCH HELPERS
+function listFilter(list, fields, q) { return list.filter(x => fields.some(fn => String(fn(x || '')).toLowerCase().includes(q))); }
+function renderFiltered(d, p, m, maint, docs) {
+  const dl = el('#droneList'), pl = el('#pilotList'), ml = el('#missionList'), mal = el('#maintenanceList'), dl2 = el('#documentList');
+  if (dl) { dl.innerHTML = ''; d.forEach(x => { const pilot = state.pilots.find(pp => pp.id === x.pilotId); const item = document.createElement('div'); item.className = 'item'; item.innerHTML = `<div class="row"><strong>${x.name}</strong><span class="badge ${x.status}">${x.status.toUpperCase()}</span></div><div class="grid"><div class="small">Model: ${x.model}</div><div class="small">Battery: ${x.battery}%</div></div><div class="row"><span class="small">Pilot: ${pilot ? pilot.name : 'Unassigned'}</span><div><button class="locate-drone" data-id="${x.id}">📍 Locate</button></div></div>`; dl.appendChild(item); }); bindDroneActions(); }
+  if (pl) { pl.innerHTML = ''; p.forEach(x => { const item = document.createElement('div'); item.className = 'item'; item.innerHTML = `<div class="row"><strong>${x.name}</strong><span class="small">${x.license}</span></div><div class="row"><span class="small">${x.contact || ''}</span><span class="small">${x.homeBase || ''}</span></div>`; pl.appendChild(item); }); }
+  if (ml) { ml.innerHTML = ''; m.forEach(x => { const d0 = state.drones.find(y => y.id === x.droneId); const p0 = state.pilots.find(y => y.id === x.pilotId); const item = document.createElement('div'); item.className = 'item'; item.innerHTML = `<div class="row"><strong>${x.title}</strong><span class="small">${x.status}</span></div><div class="row"><span class="small">Drone: ${d0 ? d0.name : ''} • Pilot: ${p0 ? p0.name : ''}</span></div>`; ml.appendChild(item); }); }
+  if (mal) { mal.innerHTML = ''; maint.forEach(x => { const item = document.createElement('div'); item.className = 'item'; item.innerHTML = `<div class="row"><strong>${x.title}</strong><span class="badge ${x.status}">${x.status.toUpperCase()}</span></div><div class="small">Type: ${x.type}</div>`; mal.appendChild(item); }); }
+  if (dl2) { dl2.innerHTML = ''; docs.forEach(x => { const p1 = state.pilots.find(y => y.id === x.pilotId); const item = document.createElement('div'); item.className = 'item'; item.innerHTML = `<div class="row"><strong>${x.type}</strong><span class="badge ${x.status}">${x.status.toUpperCase()}</span></div><div class="small">Ref: ${x.number} • Pilot: ${p1 ? p1.name : ''}</div>`; dl2.appendChild(item); }); }
+}
+
+// INIT
+function init() {
+  console.log("🚀 Starting Sentinel Fleet");
+  const wsInput = el('#wsUrl');
+  if (wsInput && API_HOST && API_HOST !== 'localhost') wsInput.value = `ws://${API_HOST}:8081`;
+  initData();
+  bindTabs();
+  initMap();
+  hideModal();
+  syncFromServer(); // Cloud Sync on startup
+  handleForms();
+  renderPilots();
+  renderDrones();
+  renderMissions();
+  renderMaintenance();
+  renderDocuments();
+  renderAnalytics();
+  renderAlerts();
+  renderPilotApplications();
+  refreshSelects();
+  renderSubscription();
+  renderStorageStatus();
+
+  // Initialize telemetry for all drones
+  state.drones.forEach(d => {
+    getPosition(d.id);
+    updateTelemetry(d.id);
+  });
+
+  syncMarkers();
+  fitMapToMarkers();
+  renderTelemetryFeed();
+  // Pilot portal state
+  const welcome = el('#pilotWelcome'); const logout = el('#logoutBtn');
+  if (state.auth.token && state.auth.isPilot && welcome && logout) {
+    setPilotPortalAccess(true);
+    welcome.style.display = 'block';
+    welcome.textContent = `Logged in as Pilot #${state.auth.pilotId}`;
+    logout.style.display = 'inline-block';
+    logout.onclick = () => {
+      state.auth.token = ''; state.auth.pilotId = ''; state.auth.isPilot = false;
+      sessionStorage.removeItem('sentinel_token'); sessionStorage.removeItem('sentinel_pilotId'); sessionStorage.removeItem('sentinel_isPilot');
+      setPilotPortalAccess(false);
+      if (welcome) { welcome.style.display = 'none' }
+      if (el('#flightPlanForm')) el('#flightPlanForm').style.display = 'none';
+      if (el('#pilotDocForm')) el('#pilotDocForm').style.display = 'none';
+      if (el('#flightPlanList')) el('#flightPlanList').style.display = 'none';
+      if (el('#pilotDocumentList')) el('#pilotDocumentList').style.display = 'none';
+      if (el('#pilotFollowWrap')) el('#pilotFollowWrap').style.display = 'none';
+      logout.style.display = 'none';
+    };
+    el('#flightPlanForm').style.display = 'grid';
+    el('#pilotDocForm').style.display = 'grid';
+    fetchFlightPlans().then(renderFlightPlans);
+    fetchPilotDocuments().then(renderPilotDocuments);
+  }
+  const followWrap = el('#pilotFollowWrap'); const followToggle = el('#followMissionToggle');
+  if (followWrap && state.auth.token && state.auth.isPilot) {
+    followWrap.style.display = 'block';
+    if (followToggle) {
+      followToggle.checked = !!state.followMission;
+      followToggle.onchange = () => { state.followMission = followToggle.checked; };
+    }
+    renderPilotMissions();
+  }
+
+  setAdminPortalAccess(!!state.adminAuth.isAdmin);
+  // Enforce pilot-only visibility after initial admin setup
+  if (state.auth.isPilot) setPilotPortalAccess(true);
+  const searchInput = el('#search');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      const q = (e.target.value || '').toLowerCase().trim();
+      if (!q) { renderPilots(); renderDrones(); renderMissions(); renderMaintenance(); renderDocuments(); setVisibleMarkers(Object.keys(state.markers)); fitMapToMarkers(); return; }
+      const d = listFilter(state.drones, [(x) => x.name, (x) => x.model, (x) => x.status, (x) => { const p = state.pilots.find(p => p.id === x.pilotId); return p ? p.name : '' }], q);
+      const p = listFilter(state.pilots, [(x) => x.name, (x) => x.license, (x) => x.homeBase], q);
+      const m = listFilter(state.missions, [(x) => x.title, (x) => x.status], q);
+      const maint = listFilter(state.maintenance, [(x) => x.title, (x) => x.type, (x) => x.status], q);
+      const docs = listFilter(state.documents, [(x) => x.type, (x) => x.number, (x) => x.status], q);
+      renderFiltered(d, p, m, maint, docs);
+      const ids = d.map(x => x.id); setVisibleMarkers(ids.length ? ids : Object.keys(state.markers)); if (ids.length) fitMapToMarkers(ids); else fitMapToMarkers();
+    });
+  }
+
+  // Start live telemetry feed — Admin only; skip entirely for pilot-only sessions
+  setInterval(() => {
+    // Gate: do NOT simulate or expose tracking data to pilot-only sessions
+    const pilotActive = isPilotOnly();
+    if (pilotActive) return;
+
+    if (!wsConnected && !httpPollInterval) {
+      state.drones.forEach(d => {
+        const pos = getPosition(d.id);
+        pos.lat += (Math.random() - 0.5) * 0.008;
+        pos.lon += (Math.random() - 0.5) * 0.008;
+        updateTelemetry(d.id);
+      });
+    }
+    syncMarkers();
+    renderTelemetryFeed();
+    if (state.followMission && state.activeMissionId) {
+      const m = state.missions.find(x => x.id === state.activeMissionId && x.pilotId === state.auth.pilotId);
+      if (m) { const p = getPosition(m.droneId); if (map) map.setView([p.lat, p.lon], 12); }
+    }
+  }, 2000);
+
+  console.log("✓ Ready - Telemetry streaming");
+}
+
+function parseTelemetryCSV(text) {
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length < 2) return null;
+  const headers = lines[0].toLowerCase().split(',');
+  const rows = lines.slice(1).map(l => l.split(','));
+
+  const durIdx = headers.findIndex(h => h.includes('duration') || h.includes('time'));
+  const latIdx = headers.findIndex(h => h.includes('lat'));
+  const lonIdx = headers.findIndex(h => h.includes('lon'));
+
+  let totalDuration = 0;
+  let locations = [];
+
+  rows.forEach(r => {
+    if (durIdx >= 0 && r[durIdx]) totalDuration = Math.max(totalDuration, parseFloat(r[durIdx]));
+    if (latIdx >= 0 && lonIdx >= 0 && r[latIdx] && r[lonIdx]) {
+      locations.push([parseFloat(r[latIdx]), parseFloat(r[lonIdx])]);
+    }
+  });
+
+  return {
+    duration: Math.ceil(totalDuration / 60) || 30,
+    locations: locations.slice(0, 100)
+  };
+}
+
+function handleTelemetryImport(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const data = parseTelemetryCSV(e.target.result);
+    if (data) {
+      const f = el('#missionForm');
+      if (f) {
+        f.duration.value = data.duration;
+        f.notes.value = `Auto-filled from telemetry log. ${data.locations.length} data points found.`;
+        alert(`Successfully parsed telemetry! Found ${data.duration} minute flight.`);
+      }
+    }
+  };
+  reader.readAsText(file);
+}
+
+document.addEventListener("DOMContentLoaded", init);
+
+// Global modal closing bindings
+(function () {
+  const modal = document.getElementById('modal');
+  if (modal) {
+    modal.addEventListener('click', (e) => { if (e.target === modal) { hideModal(); } });
+  }
+  const closeBtn = document.getElementById('modalClose'); if (closeBtn) closeBtn.addEventListener('click', hideModal);
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideModal(); });
+})();
+
+// Modal global handlers
+(function () {
+  const modal = document.getElementById('modal');
+  const closeBtn = document.getElementById('modalClose');
+  if (closeBtn) closeBtn.addEventListener('click', () => { const m = document.getElementById('modal'); if (m) m.hidden = true; });
+  if (modal) modal.addEventListener('click', (e) => { if (e.target === modal) { modal.hidden = true; } });
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') { const m = document.getElementById('modal'); if (m) m.hidden = true; } });
+})();

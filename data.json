@@ -1,0 +1,45 @@
+import time
+import requests
+import random
+
+# CONFIGURATION
+API_URL = "http://localhost:8080/api/telemetry"
+DRONE_ID = "Eagle-1"  # Matches the ID in Sentinel
+
+def send_telemetry(lat, lon, battery):
+    payload = {
+        "droneId": DRONE_ID,
+        "lat": lat,
+        "lon": lon,
+        "battery": battery,
+        "speed": random.randint(20, 45),
+        "altitude": random.randint(50, 120),
+        "signal": 98,
+        "status": "active"
+    }
+    try:
+        r = requests.post(API_URL, json=payload)
+        if r.status_code == 200:
+            print(f"📡 [SENTINEL BRIDGE] Sent: {lat:.5f}, {lon:.5f} | Battery: {battery}%")
+        else:
+            print(f"❌ error: {r.status_code}")
+    except Exception as e:
+        print(f"❌ Connection error: {e}")
+
+def main():
+    print(f"🚀 Starting Sentinel Hardware Bridge for Drone: {DRONE_ID}")
+    # Simulated Flight Path in South Africa
+    start_lat, start_lon = -28.5, 24.7
+    battery = 100
+    
+    while battery > 0:
+        # Simulate movement
+        start_lat += random.uniform(-0.0001, 0.0001)
+        start_lon += random.uniform(-0.0001, 0.0001)
+        battery -= 1
+        
+        send_telemetry(start_lat, start_lon, battery)
+        time.sleep(2)  # Update frequency
+
+if __name__ == "__main__":
+    main()

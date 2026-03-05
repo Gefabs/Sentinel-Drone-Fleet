@@ -1,0 +1,381 @@
+import json
+import hashlib
+import os
+import time
+import threading
+import socket
+import struct
+import base64
+import hashlib as _hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+
+DATA_PATH = 'api/data.json'
+
+def load_data():
+    try:
+        with open(DATA_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"drones":[],"pilots":[],"missions":[],"maintenance":[],"documents":[],"flightplans":[],"subscription":{"status":"active","expiresAt":None}}
+
+def save_data(data):
+    with open(DATA_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared state between HTTP and WebSocket servers
+# ─────────────────────────────────────────────────────────────────────────────
+shared_telemetry = {}   # droneId -> telemetry dict
+ws_clients = set()      # active WebSocket client sockets
+ws_clients_lock = threading.Lock()
+
+def broadcast_telemetry():
+    """Send the current telemetry store to all connected WebSocket clients."""
+    items = list(shared_telemetry.values())
+    if not items:
+        return
+    payload = json.dumps(items)
+    frame = _ws_encode(payload)
+    dead = set()
+    with ws_clients_lock:
+        for client in list(ws_clients):
+            try:
+                client.sendall(frame)
+            except Exception:
+                dead.add(client)
+        ws_clients -= dead
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal WebSocket frame encoder / decoder (RFC 6455)
+# ─────────────────────────────────────────────────────────────────────────────
+def _ws_encode(text):
+    """Encode a text string as a WebSocket text frame."""
+    data = text.encode('utf-8')
+    length = len(data)
+    if length <= 125:
+        header = bytes([0x81, length])
+    elif length <= 65535:
+        header = bytes([0x81, 126]) + struct.pack('>H', length)
+    else:
+        header = bytes([0x81, 127]) + struct.pack('>Q', length)
+    return header + data
+
+def _ws_handshake(client_sock):
+    """Perform the HTTP → WebSocket upgrade handshake. Returns True on success."""
+    try:
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = client_sock.recv(1024)
+            if not chunk:
+                return False
+            data += chunk
+        headers = {}
+        lines = data.decode('utf-8', errors='replace').split('\r\n')
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip().lower()] = v.strip()
+        key = headers.get('sec-websocket-key', '')
+        if not key:
+            return False
+        accept = base64.b64encode(
+            _hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()
+        ).decode()
+        response = (
+            'HTTP/1.1 101 Switching Protocols\r\n'
+            'Upgrade: websocket\r\n'
+            'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Accept: {accept}\r\n'
+            'Access-Control-Allow-Origin: *\r\n'
+            '\r\n'
+        )
+        client_sock.sendall(response.encode())
+        return True
+    except Exception as exc:
+        print(f'[WS] Handshake error: {exc}')
+        return False
+
+def _ws_recv_frame(client_sock):
+    """Read one WebSocket frame. Returns (opcode, payload_str) or (None, None)."""
+    try:
+        header = b''
+        while len(header) < 2:
+            chunk = client_sock.recv(2 - len(header))
+            if not chunk:
+                return None, None
+            header += chunk
+        b0, b1 = header[0], header[1]
+        opcode = b0 & 0x0F
+        masked = (b1 & 0x80) != 0
+        length = b1 & 0x7F
+        if length == 126:
+            raw = b''
+            while len(raw) < 2:
+                raw += client_sock.recv(2 - len(raw))
+            length = struct.unpack('>H', raw)[0]
+        elif length == 127:
+            raw = b''
+            while len(raw) < 8:
+                raw += client_sock.recv(8 - len(raw))
+            length = struct.unpack('>Q', raw)[0]
+        if masked:
+            mask = b''
+            while len(mask) < 4:
+                mask += client_sock.recv(4 - len(mask))
+        payload = b''
+        while len(payload) < length:
+            chunk = client_sock.recv(length - len(payload))
+            if not chunk:
+                return None, None
+            payload += chunk
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return opcode, payload.decode('utf-8', errors='replace')
+    except Exception:
+        return None, None
+
+def _handle_ws_client(client_sock, addr):
+    """Thread target for a single WebSocket client."""
+    if not _ws_handshake(client_sock):
+        client_sock.close()
+        return
+    with ws_clients_lock:
+        ws_clients.add(client_sock)
+    print(f'[WS] Client connected: {addr}')
+    try:
+        # Send current telemetry immediately on connect
+        items = list(shared_telemetry.values())
+        if items:
+            client_sock.sendall(_ws_encode(json.dumps(items)))
+        while True:
+            opcode, payload = _ws_recv_frame(client_sock)
+            if opcode is None:
+                break
+            if opcode == 0x8:   # close
+                break
+            if opcode == 0x1:   # text
+                try:
+                    msg = json.loads(payload)
+                    if isinstance(msg, dict) and msg.get('droneId'):
+                        shared_telemetry[msg['droneId']] = msg
+                        broadcast_telemetry()
+                except Exception:
+                    pass
+    finally:
+        with ws_clients_lock:
+            ws_clients.discard(client_sock)
+        client_sock.close()
+        print(f'[WS] Client disconnected: {addr}')
+
+def run_ws_server(host='0.0.0.0', port=8081):
+    """Run a raw TCP WebSocket server on the given port."""
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((host, port))
+    server_sock.listen(10)
+    print(f'[WS] WebSocket server on ws://{host}:{port}/telemetry')
+    while True:
+        try:
+            client_sock, addr = server_sock.accept()
+            t = threading.Thread(target=_handle_ws_client, args=(client_sock, addr), daemon=True)
+            t.start()
+        except Exception as exc:
+            print(f'[WS] Accept error: {exc}')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP handler (unchanged API, now shares telemetry with WS)
+# ─────────────────────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    store = load_data()
+    tokens = {}  # token -> pilotId
+
+    @staticmethod
+    def _hash_pw(pw, salt=None):
+        if not salt:
+            salt = os.urandom(16).hex()
+        h = hashlib.sha256((salt + pw).encode('utf-8')).hexdigest()
+        return h, salt
+
+    @staticmethod
+    def _auth_pilot(headers):
+        auth = headers.get('Authorization','')
+        if auth.startswith('Bearer '):
+            token = auth.split(' ',1)[1]
+            pid = Handler.tokens.get(token)
+            return pid
+        return None
+
+    def _set_headers(self, code=200):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress request logging noise
+
+    def do_OPTIONS(self):
+        self._set_headers(200)
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        parts = [x for x in p.path.split('/') if x]
+        if len(parts) == 1 and parts[0] == 'api':
+            return self._respond({"ok":True})
+        if len(parts) >= 2 and parts[0] == 'api':
+            res = parts[1]
+            if res in ['drones','pilots','missions','maintenance','documents']:
+                return self._respond(Handler.store.get(res, []))
+            if res == 'flightplans':
+                pid = self._auth_pilot(self.headers)
+                if not pid:
+                    self._set_headers(401)
+                    return self.wfile.write(b'{"error":"unauthorized"}')
+                plans = [fp for fp in Handler.store.get('flightplans',[]) if fp.get('pilotId')==pid]
+                return self._respond(plans)
+            if res == 'subscription':
+                return self._respond(Handler.store.get('subscription', {"status":"unknown","expiresAt":None}))
+            if res == 'telemetry':
+                # Return live telemetry from shared store
+                items = list(shared_telemetry.values())
+                if not items:
+                    for d in Handler.store.get('drones', []):
+                        items.append({"droneId":d.get('id'),"lat":-28.5,"lon":24.7,
+                                      "battery":d.get('battery',100),"status":d.get('status','active'),
+                                      "speed":0,"altitude":0,"signal":100})
+                return self._respond(items)
+            if res == 'auth':
+                return self._respond({"ok":True})
+        self._set_headers(404)
+        self.wfile.write(b'{"error":"not found"}')
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        parts = [x for x in p.path.split('/') if x]
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8') if length>0 else '{}'
+        data = json.loads(body or '{}')
+        if len(parts) >= 2 and parts[0] == 'api':
+            res = parts[1]
+            if res == 'telemetry':
+                did = data.get('droneId')
+                if did:
+                    shared_telemetry[did] = data
+                    broadcast_telemetry()
+                return self._respond({"ok":True})
+            if res in ['drones','pilots','missions','maintenance','documents']:
+                arr = Handler.store.setdefault(res, [])
+                arr.append(data)
+                save_data(Handler.store)
+                return self._respond({"ok":True})
+            if res == 'flightplans':
+                pid = self._auth_pilot(self.headers)
+                if not pid:
+                    self._set_headers(401)
+                    return self.wfile.write(b'{"error":"unauthorized"}')
+                fp = dict(data)
+                fp['id'] = fp.get('id') or (hex(int(time.time()*1000))[2:])
+                fp['pilotId'] = pid
+                arr = Handler.store.setdefault('flightplans', [])
+                arr.append(fp)
+                save_data(Handler.store)
+                return self._respond({"ok":True,"id":fp['id']})
+            if res == 'auth' and len(parts)>=3:
+                act = parts[2]
+                if act == 'register':
+                    name = data.get('name','').strip()
+                    license_no = data.get('license','').strip()
+                    password = data.get('password','')
+                    if not (name and license_no and password):
+                        self._set_headers(400); return self.wfile.write(b'{"error":"missing fields"}')
+                    h,s = Handler._hash_pw(password)
+                    pid = hex(int(time.time()*1000))[2:]
+                    pilot = {"id":pid,"name":name,"license":license_no,"status":"active","password_hash":h,"password_salt":s}
+                    Handler.store.setdefault('pilots', []).append(pilot)
+                    save_data(Handler.store)
+                    return self._respond({"ok":True,"pilotId":pid})
+                if act == 'login':
+                    license_no = data.get('license','').strip()
+                    password = data.get('password','')
+                    pilot = next((p for p in Handler.store.get('pilots',[]) if p.get('license')==license_no), None)
+                    if not pilot or not pilot.get('password_hash') or not pilot.get('password_salt'):
+                        self._set_headers(401); return self.wfile.write(b'{"error":"invalid credentials"}')
+                    h,_ = Handler._hash_pw(password, pilot['password_salt'])
+                    if h != pilot['password_hash']:
+                        self._set_headers(401); return self.wfile.write(b'{"error":"invalid credentials"}')
+                    token = os.urandom(16).hex()
+                    Handler.tokens[token] = pilot['id']
+                    return self._respond({"ok":True,"token":token,"pilotId":pilot['id']})
+        self._set_headers(404)
+        self.wfile.write(b'{"error":"not found"}')
+
+    def do_PUT(self):
+        p = urlparse(self.path)
+        parts = [x for x in p.path.split('/') if x]
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8') if length>0 else '{}'
+        data = json.loads(body or '{}')
+        if len(parts) >= 3 and parts[0] == 'api':
+            res = parts[1]
+            rid = parts[2]
+            if res in ['drones','pilots','missions','maintenance','documents']:
+                arr = Handler.store.setdefault(res, [])
+                Handler.store[res] = [data if str(x.get('id'))==rid else x for x in arr]
+                save_data(Handler.store)
+                return self._respond({"ok":True})
+            if res == 'flightplans':
+                pid = self._auth_pilot(self.headers)
+                if not pid:
+                    self._set_headers(401); return self.wfile.write(b'{"error":"unauthorized"}')
+                arr = Handler.store.setdefault('flightplans', [])
+                Handler.store['flightplans'] = [data if (str(x.get('id'))==rid and x.get('pilotId')==pid) else x for x in arr]
+                save_data(Handler.store)
+                return self._respond({"ok":True})
+        self._set_headers(404)
+        self.wfile.write(b'{"error":"not found"}')
+
+    def do_DELETE(self):
+        p = urlparse(self.path)
+        parts = [x for x in p.path.split('/') if x]
+        if len(parts) >= 3 and parts[0] == 'api':
+            res = parts[1]
+            rid = parts[2]
+            if res in ['drones','pilots','missions','maintenance','documents']:
+                arr = Handler.store.setdefault(res, [])
+                Handler.store[res] = [x for x in arr if str(x.get('id'))!=rid]
+                save_data(Handler.store)
+                return self._respond({"ok":True})
+            if res == 'flightplans':
+                pid = self._auth_pilot(self.headers)
+                if not pid:
+                    self._set_headers(401); return self.wfile.write(b'{"error":"unauthorized"}')
+                arr = Handler.store.setdefault('flightplans', [])
+                Handler.store['flightplans'] = [x for x in arr if not (str(x.get('id'))==rid and x.get('pilotId')==pid)]
+                save_data(Handler.store)
+                return self._respond({"ok":True})
+        self._set_headers(404)
+        self.wfile.write(b'{"error":"not found"}')
+
+    def _respond(self, obj):
+        self._set_headers(200)
+        self.wfile.write(json.dumps(obj).encode('utf-8'))
+
+
+def run(http_host='0.0.0.0', http_port=8080, ws_port=8081):
+    # Start WebSocket server in background thread
+    ws_thread = threading.Thread(target=run_ws_server, args=(http_host, ws_port), daemon=True)
+    ws_thread.start()
+
+    # Start HTTP server (blocking)
+    httpd = HTTPServer((http_host, http_port), Handler)
+    print(f'[HTTP] API server on http://{http_host}:{http_port}/api')
+    print(f'[WS]  WebSocket ready on ws://{http_host}:{ws_port}')
+    print(f'[WS]  Connect the Telemetry tab to: ws://localhost:{ws_port}')
+    httpd.serve_forever()
+
+
+if __name__ == '__main__':
+    run()

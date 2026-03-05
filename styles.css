@@ -1,0 +1,13 @@
+@echo off
+cd /d "%~dp0"
+echo Starting Sentinel API server (HTTP :8080 + WebSocket :8081)...
+start "Sentinel API" python api/server.py
+echo Starting file server (HTTP :8010)...
+start "Sentinel Web" python -m http.server 8010
+timeout /t 2 >nul
+start "" http://localhost:8010/
+echo.
+echo  HTTP  API  : http://localhost:8080/api
+echo  WebSocket  : ws://localhost:8081
+echo  Web App    : http://localhost:8010
+echo.

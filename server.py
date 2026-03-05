@@ -1,0 +1,1 @@
+{"drones": [], "pilots": [{"name": "Petri", "license": "123", "licenseExpiry": "1902-11-11", "contact": "123456789", "homeBase": "HK", "flightHours": 0, "status": "active", "id": "lwzbttuk"}], "missions": [], "maintenance": [], "documents": [], "subscription": {"status": "active", "expiresAt": null}}
